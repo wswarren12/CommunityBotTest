@@ -1,7 +1,7 @@
 import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
 import Anthropic from '@anthropic-ai/sdk';
 import { generateSummary, detectEvents, testConnection } from '../../src/services/aiService';
-import { MessageWithUser, EventType } from '../../src/types/database';
+import { MessageWithUser } from '../../src/types/database';
 import * as logger from '../../src/utils/logger';
 
 // Mock dependencies
@@ -10,7 +10,7 @@ jest.mock('../../src/utils/logger');
 
 describe('aiService', () => {
   let mockAnthropicInstance: any;
-  let mockCreate: jest.Mock;
+  let mockCreate: any;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -33,7 +33,6 @@ describe('aiService', () => {
   describe('generateSummary', () => {
     const mockMessages: MessageWithUser[] = [
       {
-        id: 1,
         message_id: 'msg1',
         channel_id: 'channel1',
         user_id: 'user1',
@@ -47,11 +46,10 @@ describe('aiService', () => {
         attachment_count: 0,
         created_at: new Date(),
         author_name: 'TestUser',
-        author_global_name: null,
+        author_global_name: undefined,
         channel_name: 'general',
       },
       {
-        id: 2,
         message_id: 'msg2',
         channel_id: 'channel1',
         user_id: 'user2',
@@ -65,7 +63,7 @@ describe('aiService', () => {
         attachment_count: 0,
         created_at: new Date(),
         author_name: 'OtherUser',
-        author_global_name: null,
+        author_global_name: undefined,
         channel_name: 'general',
       },
     ];
@@ -312,7 +310,6 @@ describe('aiService', () => {
   describe('detectEvents', () => {
     const mockMessages: MessageWithUser[] = [
       {
-        id: 1,
         message_id: 'msg1',
         channel_id: 'channel1',
         user_id: 'user1',
@@ -326,7 +323,7 @@ describe('aiService', () => {
         attachment_count: 0,
         created_at: new Date(),
         author_name: 'TestUser',
-        author_global_name: null,
+        author_global_name: undefined,
         channel_name: 'general',
       },
     ];

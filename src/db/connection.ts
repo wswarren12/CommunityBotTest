@@ -1,12 +1,13 @@
 import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { logger } from '../utils/logger';
+import { hashQueryForLogs } from '../utils/sanitization';
 
 let pool: Pool | null = null;
 
 /**
  * Initialize the PostgreSQL connection pool
  */
-export function initializeDatabase(connectionString: string): Pool {
+export async function initializeDatabase(connectionString: string): Promise<Pool> {
   if (pool) {
     logger.warn('Database pool already initialized');
     return pool;
@@ -15,8 +16,10 @@ export function initializeDatabase(connectionString: string): Pool {
   pool = new Pool({
     connectionString,
     max: 20, // Maximum number of clients in the pool
+    min: 2, // Maintain minimum 2 connections
     idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
     connectionTimeoutMillis: 10000, // Return error after 10 seconds if cannot connect
+    allowExitOnIdle: true, // Allow process to exit if all connections idle
   });
 
   // Handle pool errors
@@ -24,14 +27,14 @@ export function initializeDatabase(connectionString: string): Pool {
     logger.error('Unexpected error on idle PostgreSQL client', err);
   });
 
-  // Test the connection
-  pool.query('SELECT NOW()', (err, result) => {
-    if (err) {
-      logger.error('Failed to connect to database', err);
-      throw err;
-    }
+  // Test the connection with async/await
+  try {
+    const result = await pool.query('SELECT NOW()');
     logger.info('Database connection established', { timestamp: result.rows[0].now });
-  });
+  } catch (err) {
+    logger.error('Failed to connect to database', err);
+    throw err;
+  }
 
   return pool;
 }
@@ -51,7 +54,7 @@ export function getPool(): Pool {
  */
 export async function query<T extends QueryResultRow = any>(
   text: string,
-  params?: any[]
+  params?: unknown[]
 ): Promise<QueryResult<T>> {
   const pool = getPool();
   const start = Date.now();
@@ -61,16 +64,19 @@ export async function query<T extends QueryResultRow = any>(
     const duration = Date.now() - start;
 
     logger.debug('Executed query', {
-      query: text.substring(0, 100),
+      queryHash: hashQueryForLogs(text),
+      paramCount: params?.length ?? 0,
       duration: `${duration}ms`,
       rows: result.rowCount,
     });
 
     return result;
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     logger.error('Query error', {
-      query: text.substring(0, 100),
-      error: error instanceof Error ? error.message : 'Unknown error',
+      queryHash: hashQueryForLogs(text),
+      paramCount: params?.length ?? 0,
+      error: errorMessage,
     });
     throw error;
   }
@@ -127,13 +133,12 @@ export async function runCleanup(): Promise<number> {
     const result = await query<{ deleted_count: number }>(
       'SELECT cleanup_old_messages() as deleted_count'
     );
-    const deletedCount = result.rows[0]?.deleted_count || 0;
+    const deletedCount = result.rows[0]?.deleted_count ?? 0;
     logger.info('Database cleanup completed', { deletedMessages: deletedCount });
     return deletedCount;
   } catch (error) {
-    logger.error('Database cleanup failed', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Database cleanup failed', { error: errorMessage });
     throw error;
   }
 }
@@ -146,9 +151,8 @@ export async function healthCheck(): Promise<boolean> {
     await query('SELECT 1');
     return true;
   } catch (error) {
-    logger.error('Database health check failed', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Database health check failed', { error: errorMessage });
     return false;
   }
 }

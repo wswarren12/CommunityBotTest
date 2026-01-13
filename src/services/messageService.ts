@@ -86,11 +86,9 @@ export async function ingestMessage(message: Message): Promise<void> {
       guildId,
     });
   } catch (error) {
-    logger.error('Failed to ingest message', {
-      messageId,
-      error: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const stack = error instanceof Error ? error.stack : undefined;
+    logger.error('Failed to ingest message', { messageId, error: errorMessage, stack });
     throw error;
   }
 }
@@ -106,9 +104,11 @@ export async function getUserAccessibleChannels(
   const accessibleChannels: string[] = [];
 
   for (const [channelId, channel] of guild.channels.cache) {
+    const permissions = channel.permissionsFor(guildMember);
     if (
       channel.isTextBased() &&
-      channel.permissionsFor(guildMember)?.has('ViewChannel')
+      permissions?.has('ViewChannel') &&
+      permissions?.has('ReadMessageHistory')
     ) {
       accessibleChannels.push(channelId);
     }
@@ -130,5 +130,6 @@ export async function canUserAccessChannel(
     return false;
   }
 
-  return channel.permissionsFor(guildMember)?.has('ViewChannel') ?? false;
+  const permissions = channel.permissionsFor(guildMember);
+  return (permissions?.has('ViewChannel') && permissions?.has('ReadMessageHistory')) || false;
 }

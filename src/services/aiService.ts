@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { logger } from '../utils/logger';
 import { MessageWithUser, EventType } from '../types/database';
+import { sanitizeForPrompt } from '../utils/sanitization';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -111,10 +112,8 @@ export async function generateSummary(
       categories,
     };
   } catch (error) {
-    logger.error('Failed to generate summary', {
-      userId: request.userId,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to generate summary', { userId: request.userId, error: errorMessage });
     throw new Error('Failed to generate summary with AI');
   }
 }
@@ -153,9 +152,8 @@ export async function detectEvents(
 
     return { events };
   } catch (error) {
-    logger.error('Failed to detect events', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to detect events', { error: errorMessage });
     return { events: [] }; // Return empty array on error
   }
 }
@@ -170,13 +168,14 @@ function buildSummaryPrompt(
   const { username, sinceTimestamp, messages, userRoles, mentionCount, guildName } = request;
 
   const messagesText = messages
-    .map(
-      (msg) =>
-        `[${msg.posted_at.toISOString()}] #${msg.channel_name} - ${msg.author_name}: ${msg.content.substring(0, 500)}`
-    )
+    .map((msg) => {
+      const sanitizedContent = sanitizeForPrompt(msg.content);
+      const truncatedContent = sanitizedContent.substring(0, 500);
+      return `[${msg.posted_at.toISOString()}] #${msg.channel_name} - ${msg.author_name}: ${truncatedContent}`;
+    })
     .join('\n');
 
-  const detailInstructions = {
+  const detailInstructions: Record<typeof detailLevel, string> = {
     brief: 'Maximum 5-7 main bullet points. Be very concise.',
     detailed: 'Provide 10-15 bullet points with more context and details.',
     full: 'Provide comprehensive details with quotes and full context.',
@@ -217,10 +216,11 @@ function buildEventDetectionPrompt(request: EventDetectionRequest): string {
   const { messages, serverTimezone, currentDate } = request;
 
   const messagesText = messages
-    .map(
-      (msg) =>
-        `[${msg.message_id}] ${msg.author_name} in #${msg.channel_name} at ${msg.posted_at.toISOString()}: ${msg.content}`
-    )
+    .map((msg) => {
+      const sanitizedContent = sanitizeForPrompt(msg.content);
+      const timestamp = msg.posted_at.toISOString();
+      return `[${msg.message_id}] ${msg.author_name} in #${msg.channel_name} at ${timestamp}: ${sanitizedContent}`;
+    })
     .join('\n\n');
 
   return `You are analyzing Discord messages to detect upcoming events and gatherings.
@@ -283,8 +283,9 @@ function parseEventDetectionResponse(responseText: string): DetectedEvent[] {
     const parsed = JSON.parse(jsonText);
     return Array.isArray(parsed) ? parsed : [];
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     logger.error('Failed to parse event detection response', {
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: errorMessage,
       responseText: responseText.substring(0, 500),
     });
     return [];
@@ -306,21 +307,15 @@ export async function testConnection(): Promise<boolean> {
     const response = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 50,
-      messages: [
-        {
-          role: 'user',
-          content: 'Say "OK" if you can read this.',
-        },
-      ],
+      messages: [{ role: 'user', content: 'Say "OK" if you can read this.' }],
     });
 
     const text = extractTextFromResponse(response);
     logger.info('Claude API connection test successful', { response: text });
     return true;
   } catch (error) {
-    logger.error('Claude API connection test failed', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Claude API connection test failed', { error: errorMessage });
     return false;
   }
 }

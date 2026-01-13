@@ -4,6 +4,7 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
 
+import { Client } from 'discord.js';
 import { createClient, loginClient, shutdownClient } from './bot/client';
 import { initializeDatabase, closeDatabase, runCleanup } from './db/connection';
 import { logger } from './utils/logger';
@@ -12,6 +13,8 @@ import { handleMessageCreate } from './bot/events/messageCreate';
 import { handleInteractionCreate } from './bot/events/interactionCreate';
 import { syncDiscordEvents, detectEventsFromMessages } from './services/eventService';
 import { testConnection } from './services/aiService';
+import { startCacheCleanup, stopCacheCleanup } from './commands/catchup';
+import { startRateLimitCleanup, stopRateLimitCleanup } from './utils/rateLimiter';
 
 /**
  * Main application entry point
@@ -25,7 +28,7 @@ async function main() {
   try {
     // Initialize database
     const databaseUrl = process.env.DATABASE_URL!;
-    initializeDatabase(databaseUrl);
+    await initializeDatabase(databaseUrl);
     logger.info('Database initialized');
 
     // Test Claude API connection
@@ -76,18 +79,14 @@ async function main() {
       });
     });
 
-    process.on('unhandledRejection', (reason, _promise) => {
-      logger.error('Unhandled promise rejection', {
-        reason: reason instanceof Error ? reason.message : String(reason),
-        stack: reason instanceof Error ? reason.stack : undefined,
-      });
+    process.on('unhandledRejection', (reason) => {
+      const errorMessage = reason instanceof Error ? reason.message : String(reason);
+      const stack = reason instanceof Error ? reason.stack : undefined;
+      logger.error('Unhandled promise rejection', { reason: errorMessage, stack });
     });
 
     process.on('uncaughtException', (error) => {
-      logger.error('Uncaught exception', {
-        error: error.message,
-        stack: error.stack,
-      });
+      logger.error('Uncaught exception', { error: error.message, stack: error.stack });
       gracefulShutdown(client);
     });
 
@@ -133,65 +132,94 @@ function validateEnvironment(): void {
   }
 }
 
+// Background task interval IDs for cleanup
+let cleanupIntervalId: NodeJS.Timeout | null = null;
+let eventDetectionIntervalId: NodeJS.Timeout | null = null;
+
 /**
  * Start background tasks
  */
-function startBackgroundTasks(client: any): void {
-  const cleanupInterval = parseInt(process.env.CLEANUP_INTERVAL_HOURS || '24', 10);
+function startBackgroundTasks(client: Client): void {
+  const cleanupIntervalHours = parseInt(process.env.CLEANUP_INTERVAL_HOURS || '24', 10);
+  const cleanupIntervalMs = cleanupIntervalHours * 60 * 60 * 1000;
+  const eventDetectionIntervalMs = 6 * 60 * 60 * 1000;
 
-  // Database cleanup (30-day retention)
-  setInterval(
-    async () => {
-      logger.info('Running scheduled database cleanup...');
-      try {
-        await runCleanup();
-      } catch (error) {
-        logger.error('Scheduled cleanup failed', {
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-      }
-    },
-    cleanupInterval * 60 * 60 * 1000
-  );
+  // Cleanup task wrapper
+  const runCleanupTask = async () => {
+    logger.info('Running scheduled database cleanup...');
+    try {
+      await runCleanup();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Scheduled cleanup failed', { error: errorMessage });
+    }
+  };
 
-  // Event detection (every 6 hours)
-  setInterval(
-    async () => {
-      logger.info('Running scheduled event detection...');
-      try {
-        for (const [, guild] of client.guilds.cache) {
-          await detectEventsFromMessages(guild.id, 24);
-        }
-      } catch (error) {
-        logger.error('Scheduled event detection failed', {
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
+  // Event detection task wrapper
+  const runEventDetectionTask = async () => {
+    logger.info('Running scheduled event detection...');
+    try {
+      for (const [, guild] of client.guilds.cache) {
+        await detectEventsFromMessages(guild.id, 24);
       }
-    },
-    6 * 60 * 60 * 1000
-  );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Scheduled event detection failed', { error: errorMessage });
+    }
+  };
+
+  // Run tasks immediately, then schedule
+  runCleanupTask();
+  runEventDetectionTask();
+
+  // Store interval IDs for cleanup
+  cleanupIntervalId = setInterval(runCleanupTask, cleanupIntervalMs);
+  eventDetectionIntervalId = setInterval(runEventDetectionTask, eventDetectionIntervalMs);
+
+  // Start cache cleanup and rate limit cleanup
+  startCacheCleanup();
+  startRateLimitCleanup();
 
   logger.info('Background tasks started', {
-    cleanupInterval: `${cleanupInterval} hours`,
+    cleanupInterval: `${cleanupIntervalHours} hours`,
     eventDetectionInterval: '6 hours',
   });
 }
 
 /**
+ * Stop background tasks
+ */
+function stopBackgroundTasks(): void {
+  if (cleanupIntervalId) {
+    clearInterval(cleanupIntervalId);
+    cleanupIntervalId = null;
+  }
+  if (eventDetectionIntervalId) {
+    clearInterval(eventDetectionIntervalId);
+    eventDetectionIntervalId = null;
+  }
+  stopCacheCleanup();
+  stopRateLimitCleanup();
+  logger.info('Background tasks stopped');
+}
+
+/**
  * Graceful shutdown
  */
-async function gracefulShutdown(client: any): Promise<void> {
+async function gracefulShutdown(client: Client): Promise<void> {
   logger.info('Starting graceful shutdown...');
 
   try {
+    // Stop background tasks first
+    stopBackgroundTasks();
+
     await shutdownClient(client);
     await closeDatabase();
     logger.info('Graceful shutdown complete');
     process.exit(0);
   } catch (error) {
-    logger.error('Error during shutdown', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Error during shutdown', { error: errorMessage });
     process.exit(1);
   }
 }

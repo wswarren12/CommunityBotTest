@@ -7,11 +7,12 @@ import {
   EmbedBuilder,
   MessageFlags,
 } from 'discord.js';
+import crypto from 'crypto';
 import { generateCatchupSummary } from '../services/summaryService';
 import { logger } from '../utils/logger';
 import { DetailLevel } from '../types/database';
+import { checkRateLimit, getTimeUntilReset } from '../utils/rateLimiter';
 
-// Store summary data temporarily for expansion (in production, use Redis or similar)
 const summaryCache = new Map<
   string,
   {
@@ -32,8 +33,22 @@ export async function handleCatchupCommand(
   interaction: ChatInputCommandInteraction
 ): Promise<void> {
   try {
-    // Defer reply since summary generation may take time
+    // Defer reply FIRST to acknowledge interaction within 3 seconds
     await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+    // Check rate limit
+    const maxPerHour = parseInt(process.env.MAX_SUMMARIES_PER_HOUR || '10', 10);
+
+    if (!checkRateLimit(interaction.user.id, maxPerHour)) {
+      const resetSeconds = getTimeUntilReset(interaction.user.id);
+      const resetMinutes = Math.ceil(resetSeconds / 60);
+      const minuteText = resetMinutes === 1 ? 'minute' : 'minutes';
+
+      await interaction.editReply({
+        content: `⏱️ You've reached the rate limit of ${maxPerHour} summaries per hour.\nPlease try again in ${resetMinutes} ${minuteText}.`,
+      });
+      return;
+    }
 
     const timeframe = interaction.options.getString('timeframe') || undefined;
     const guildMember = interaction.member;
@@ -53,13 +68,14 @@ export async function handleCatchupCommand(
 
     // Generate summary
     const result = await generateCatchupSummary({
-      guildMember: guildMember as any,
+      guildMember: guildMember as import('discord.js').GuildMember,
       detailLevel: 'brief',
       customTimeframe: timeframe,
     });
 
     // Store in cache for expansion
-    const cacheKey = `${interaction.user.id}-${interaction.guildId}-${Date.now()}`;
+    const randomBytes = crypto.randomBytes(4).toString('hex');
+    const cacheKey = `${interaction.user.id}-${interaction.guildId}-${Date.now()}-${randomBytes}`;
     summaryCache.set(cacheKey, {
       userId: interaction.user.id,
       guildId: interaction.guildId!,
@@ -87,17 +103,17 @@ export async function handleCatchupCommand(
       messageCount: result.messageCount,
     });
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     logger.error('Error handling /catchup command', {
       userId: interaction.user.id,
-      error: error instanceof Error ? error.message : 'Unknown error',
+      error: errorMessage,
     });
 
-    const errorMessage =
-      error instanceof Error ? error.message : 'An unexpected error occurred.';
+    const userMessage = error instanceof Error ? error.message : 'An unexpected error occurred.';
 
     try {
       await interaction.editReply({
-        content: `❌ ${errorMessage}`,
+        content: `❌ ${userMessage}`,
       });
     } catch (replyError) {
       logger.error('Failed to send error message', {
@@ -229,23 +245,18 @@ function createDetailButtons(
     return [];
   }
 
-  const briefButton = new ButtonBuilder()
-    .setCustomId(`expand_${cacheKey}_brief`)
-    .setLabel('Brief')
-    .setStyle(currentLevel === 'brief' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(currentLevel === 'brief');
+  const createButton = (level: string, label: string) => {
+    const isActive = currentLevel === level;
+    return new ButtonBuilder()
+      .setCustomId(`expand_${cacheKey}_${level}`)
+      .setLabel(label)
+      .setStyle(isActive ? ButtonStyle.Primary : ButtonStyle.Secondary)
+      .setDisabled(isActive);
+  };
 
-  const detailedButton = new ButtonBuilder()
-    .setCustomId(`expand_${cacheKey}_detailed`)
-    .setLabel('Detailed')
-    .setStyle(currentLevel === 'detailed' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(currentLevel === 'detailed');
-
-  const fullButton = new ButtonBuilder()
-    .setCustomId(`expand_${cacheKey}_full`)
-    .setLabel('Full')
-    .setStyle(currentLevel === 'full' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-    .setDisabled(currentLevel === 'full');
+  const briefButton = createButton('brief', 'Brief');
+  const detailedButton = createButton('detailed', 'Detailed');
+  const fullButton = createButton('full', 'Full');
 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     briefButton,
@@ -256,18 +267,45 @@ function createDetailButtons(
   return [row];
 }
 
-// Clean up old cache entries every 30 minutes
-setInterval(() => {
-  const now = Date.now();
-  const thirtyMinutes = 30 * 60 * 1000;
+// Cache cleanup interval management
+let cleanupIntervalId: NodeJS.Timeout | null = null;
 
-  for (const [key, _value] of summaryCache.entries()) {
-    // Extract timestamp from cache key
-    const timestamp = parseInt(key.split('-').pop() || '0', 10);
-    if (now - timestamp > thirtyMinutes) {
-      summaryCache.delete(key);
-    }
+/**
+ * Start cache cleanup interval
+ */
+export function startCacheCleanup(): void {
+  if (cleanupIntervalId) {
+    logger.warn('Cache cleanup already running');
+    return;
   }
 
-  logger.debug('Summary cache cleaned', { remainingEntries: summaryCache.size });
-}, 30 * 60 * 1000);
+  const thirtyMinutes = 30 * 60 * 1000;
+
+  cleanupIntervalId = setInterval(() => {
+    const now = Date.now();
+
+    for (const [key] of summaryCache.entries()) {
+      // Extract timestamp from cache key (format: userId-guildId-timestamp-randomBytes)
+      const parts = key.split('-');
+      const timestamp = parseInt(parts[parts.length - 2] || '0', 10);
+      if (now - timestamp > thirtyMinutes) {
+        summaryCache.delete(key);
+      }
+    }
+
+    logger.debug('Summary cache cleaned', { remainingEntries: summaryCache.size });
+  }, thirtyMinutes);
+
+  logger.info('Summary cache cleanup started');
+}
+
+/**
+ * Stop cache cleanup interval
+ */
+export function stopCacheCleanup(): void {
+  if (cleanupIntervalId) {
+    clearInterval(cleanupIntervalId);
+    cleanupIntervalId = null;
+    logger.info('Summary cache cleanup stopped');
+  }
+}

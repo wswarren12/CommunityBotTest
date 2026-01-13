@@ -31,10 +31,8 @@ export async function syncDiscordEvents(guild: Guild): Promise<void> {
       eventCount: events.size,
     });
   } catch (error) {
-    logger.error('Failed to sync Discord events', {
-      guildId: guild.id,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to sync Discord events', { guildId: guild.id, error: errorMessage });
   }
 }
 
@@ -158,10 +156,8 @@ export async function detectEventsFromMessages(
 
     return events;
   } catch (error) {
-    logger.error('Failed to detect events from messages', {
-      guildId,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to detect events from messages', { guildId, error: errorMessage });
     return [];
   }
 }
@@ -193,10 +189,8 @@ export async function getUpcomingEvents(
 
     return events;
   } catch (error) {
-    logger.error('Failed to get upcoming events', {
-      guildId,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to get upcoming events', { guildId, error: errorMessage });
     return [];
   }
 }
@@ -209,10 +203,8 @@ export async function cancelEventById(eventId: string): Promise<void> {
     await cancelEvent(eventId);
     logger.info('Event cancelled', { eventId });
   } catch (error) {
-    logger.error('Failed to cancel event', {
-      eventId,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error('Failed to cancel event', { eventId, error: errorMessage });
     throw error;
   }
 }
@@ -237,7 +229,8 @@ export function formatEventsForSummary(events: Event[]): string {
     });
 
     const confidence = event.confidence_score ? ` (${event.confidence_score}% confidence)` : '';
-    const location = event.location || event.channel_id ? ` • ${event.location || `<#${event.channel_id}>`}` : '';
+    const locationValue = event.location || (event.channel_id ? `<#${event.channel_id}>` : '');
+    const location = locationValue ? ` • ${locationValue}` : '';
 
     formatted += `- **${event.title}** • ${startTime}${location}${confidence}\n`;
   }
@@ -253,17 +246,11 @@ function mapDiscordEventType(event: GuildScheduledEvent): EventType {
   // or try to infer from the name
   const name = event.name.toLowerCase();
 
-  if (name.includes('meeting') || name.includes('standup')) {
-    return 'meeting';
-  } else if (name.includes('game') || name.includes('gaming')) {
-    return 'gaming';
-  } else if (name.includes('stream')) {
-    return 'stream';
-  } else if (name.includes('tournament')) {
-    return 'tournament';
-  } else if (name.includes('social') || name.includes('hangout') || name.includes('party')) {
-    return 'social';
-  }
+  if (name.includes('meeting') || name.includes('standup')) return 'meeting';
+  if (name.includes('game') || name.includes('gaming')) return 'gaming';
+  if (name.includes('stream')) return 'stream';
+  if (name.includes('tournament')) return 'tournament';
+  if (name.includes('social') || name.includes('hangout') || name.includes('party')) return 'social';
 
   return 'other';
 }
@@ -273,8 +260,8 @@ function mapDiscordEventType(event: GuildScheduledEvent): EventType {
  */
 export function generateEventId(title: string, datetime: Date, organizerId: string): string {
   const hash = crypto
-    .createHash('md5')
+    .createHash('sha256')
     .update(`${title}-${datetime.toISOString()}-${organizerId}`)
     .digest('hex');
-  return `evt_${hash.substring(0, 12)}`;
+  return `evt_${hash.substring(0, 16)}`;
 }

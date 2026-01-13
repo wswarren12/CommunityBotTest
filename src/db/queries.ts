@@ -142,7 +142,7 @@ export async function insertMessage(
 
 export async function getMessages(params: GetMessagesParams): Promise<MessageWithUser[]> {
   const conditions: string[] = ['m.guild_id = $1'];
-  const values: any[] = [params.guildId];
+  const values: (string | string[] | Date | boolean | number)[] = [params.guildId];
   let paramIndex = 2;
 
   if (params.channelIds && params.channelIds.length > 0) {
@@ -288,7 +288,7 @@ export async function insertEvent(
 
 export async function getEvents(params: GetEventsParams): Promise<Event[]> {
   const conditions: string[] = ['guild_id = $1'];
-  const values: any[] = [params.guildId];
+  const values: (string | string[] | Date | number)[] = [params.guildId];
   let paramIndex = 2;
 
   if (params.channelId) {
