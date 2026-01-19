@@ -15,6 +15,8 @@ import { syncDiscordEvents, detectEventsFromMessages } from './services/eventSer
 import { testConnection } from './services/aiService';
 import { startCacheCleanup, stopCacheCleanup } from './commands/catchup';
 import { startRateLimitCleanup, stopRateLimitCleanup } from './utils/rateLimiter';
+import { startQuestRateLimitCleanup, stopQuestRateLimitCleanup } from './services/questService';
+import { mcpClient } from './services/mcpClient';
 
 /**
  * Main application entry point
@@ -179,6 +181,7 @@ function startBackgroundTasks(client: Client): void {
   // Start cache cleanup and rate limit cleanup
   startCacheCleanup();
   startRateLimitCleanup();
+  startQuestRateLimitCleanup();
 
   logger.info('Background tasks started', {
     cleanupInterval: `${cleanupIntervalHours} hours`,
@@ -189,7 +192,7 @@ function startBackgroundTasks(client: Client): void {
 /**
  * Stop background tasks
  */
-function stopBackgroundTasks(): void {
+async function stopBackgroundTasks(): Promise<void> {
   if (cleanupIntervalId) {
     clearInterval(cleanupIntervalId);
     cleanupIntervalId = null;
@@ -200,6 +203,11 @@ function stopBackgroundTasks(): void {
   }
   stopCacheCleanup();
   stopRateLimitCleanup();
+  stopQuestRateLimitCleanup();
+
+  // Disconnect MCP client
+  await mcpClient.disconnect();
+
   logger.info('Background tasks stopped');
 }
 
@@ -211,7 +219,7 @@ async function gracefulShutdown(client: Client): Promise<void> {
 
   try {
     // Stop background tasks first
-    stopBackgroundTasks();
+    await stopBackgroundTasks();
 
     await shutdownClient(client);
     await closeDatabase();

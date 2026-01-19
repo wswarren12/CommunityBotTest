@@ -157,3 +157,120 @@ export interface UpsertUserActivityParams {
   channelId: string;
   timestamp: Date;
 }
+
+// ==================== Quest Types ====================
+
+export interface Quest {
+  id: string;
+  guild_id: string;
+  name: string;
+  description: string;
+  xp_reward: number;
+  verification_type: VerificationType;
+  // Legacy direct API fields (nullable for MCP-based quests)
+  api_endpoint?: string;
+  api_method?: string;
+  api_headers?: Record<string, string>;
+  api_params?: Record<string, unknown>;
+  success_condition?: SuccessCondition;
+  // MCP Connector fields
+  connector_id?: number;
+  connector_name?: string;
+  api_key_env_var?: string;
+  user_input_placeholder?: string;
+  user_input_description?: string;
+  active: boolean;
+  max_completions?: number;
+  total_completions: number;
+  created_by: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export type VerificationType = 'email' | 'discord_id' | 'wallet_address' | 'twitter_handle';
+
+export interface SuccessCondition {
+  field: string;
+  operator: '>' | '>=' | '=' | '!=' | '<' | '<=' | 'exists' | 'not_empty';
+  value: number | string | boolean;
+}
+
+export interface UserQuest {
+  id: string;
+  user_id: string;
+  guild_id: string;
+  quest_id: string;
+  status: UserQuestStatus;
+  assigned_at: Date;
+  completed_at?: Date;
+  verification_identifier?: string;
+  verification_attempts: number;
+  xp_awarded: number;
+  failure_reason?: string;
+}
+
+export type UserQuestStatus = 'assigned' | 'completed' | 'failed' | 'expired';
+
+export interface UserQuestWithDetails extends UserQuest {
+  quest_name: string;
+  quest_description: string;
+  xp_reward: number;
+  verification_type?: VerificationType;
+  // Legacy direct API fields
+  api_endpoint?: string;
+  api_method?: string;
+  api_headers?: Record<string, string>;
+  api_params?: Record<string, unknown>;
+  success_condition?: SuccessCondition;
+  // MCP Connector fields
+  connector_id?: number;
+  connector_name?: string;
+  api_key_env_var?: string;
+  user_input_placeholder?: string;
+  user_input_description?: string;
+}
+
+export interface UserXp {
+  user_id: string;
+  guild_id: string;
+  total_xp: number;
+  quests_completed: number;
+  last_quest_at?: Date;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface QuestConversation {
+  id: string;
+  user_id: string;
+  guild_id: string;
+  channel_id?: string;
+  conversation_state: Record<string, unknown>;
+  messages: Array<{ role: string; content: string }>;
+  created_at: Date;
+  updated_at: Date;
+  expires_at: Date;
+}
+
+export interface CreateQuestParams {
+  guildId: string;
+  name: string;
+  description: string;
+  xpReward: number;
+  verificationType: VerificationType;
+  // Legacy direct API fields (optional for MCP-based quests)
+  apiEndpoint?: string;
+  apiMethod?: string;
+  apiHeaders?: Record<string, string>;
+  apiParams?: Record<string, unknown>;
+  successCondition?: SuccessCondition;
+  // MCP Connector fields
+  connectorId?: number;
+  connectorName?: string;
+  apiKeyEnvVar?: string;
+  userInputPlaceholder?: string;
+  userInputDescription?: string;
+  active?: boolean;
+  maxCompletions?: number;
+  createdBy: string;
+}

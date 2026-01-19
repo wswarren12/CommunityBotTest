@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import * as dotenv from 'dotenv';
-import { initializeDatabase, closeDatabase } from './connection';
+import { initializeDatabase, closeDatabase, getPool } from './connection';
 import { logger } from '../utils/logger';
 import * as migration001 from './migrations/001_initial_schema';
+import * as migration002 from './migrations/002_quest_schema';
+import * as migration003 from './migrations/003_mcp_connector_integration';
+import * as migration004 from './migrations/004_fix_quest_conversations_constraint';
 
 // Load environment variables
 dotenv.config();
@@ -21,7 +24,21 @@ const migrations: Migration[] = [
     up: migration001.up,
     down: migration001.down,
   },
-  // Add more migrations here as needed
+  {
+    name: '002_quest_schema',
+    up: async () => migration002.up(getPool()),
+    down: async () => migration002.down(getPool()),
+  },
+  {
+    name: '003_mcp_connector_integration',
+    up: async () => migration003.up(getPool()),
+    down: async () => migration003.down(getPool()),
+  },
+  {
+    name: '004_fix_quest_conversations_constraint',
+    up: async () => migration004.up(getPool()),
+    down: async () => migration004.down(getPool()),
+  },
 ];
 
 /**

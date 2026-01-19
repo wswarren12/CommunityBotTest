@@ -2,7 +2,7 @@
  * Database query functions for all tables
  */
 
-import { query } from './connection';
+import { query, transaction } from './connection';
 import {
   User,
   Channel,
@@ -377,4 +377,324 @@ export async function getUserSummaries(userId: string, limit: number = 10): Prom
     [userId, limit]
   );
   return result.rows;
+}
+
+// ==================== Quests ====================
+
+import {
+  Quest,
+  UserQuest,
+  UserQuestWithDetails,
+  UserXp,
+  QuestConversation,
+  CreateQuestParams,
+} from '../types/database';
+
+export async function createQuest(params: CreateQuestParams): Promise<Quest> {
+  const result = await query<Quest>(
+    `INSERT INTO quests (
+      guild_id, name, description, xp_reward, verification_type,
+      api_endpoint, api_method, api_headers, api_params,
+      success_condition, user_input_description,
+      connector_id, connector_name, api_key_env_var, user_input_placeholder,
+      active, max_completions, created_by
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+    RETURNING *`,
+    [
+      params.guildId,
+      params.name,
+      params.description,
+      params.xpReward,
+      params.verificationType,
+      params.apiEndpoint || null,
+      params.apiMethod || 'GET',
+      JSON.stringify(params.apiHeaders || {}),
+      JSON.stringify(params.apiParams || {}),
+      JSON.stringify(params.successCondition || { field: 'balance', operator: '>', value: 0 }),
+      params.userInputDescription,
+      params.connectorId || null,
+      params.connectorName || null,
+      params.apiKeyEnvVar || null,
+      params.userInputPlaceholder || null,
+      params.active ?? true,
+      params.maxCompletions,
+      params.createdBy,
+    ]
+  );
+  return result.rows[0];
+}
+
+export async function getQuest(questId: string): Promise<Quest | null> {
+  const result = await query<Quest>(`SELECT * FROM quests WHERE id = $1`, [questId]);
+  return result.rows[0] || null;
+}
+
+export async function getActiveQuests(guildId: string): Promise<Quest[]> {
+  const result = await query<Quest>(
+    `SELECT * FROM quests
+     WHERE guild_id = $1 AND active = TRUE
+     AND (max_completions IS NULL OR total_completions < max_completions)
+     ORDER BY created_at DESC`,
+    [guildId]
+  );
+  return result.rows;
+}
+
+export async function getGuildQuests(guildId: string, includeInactive: boolean = false): Promise<Quest[]> {
+  const activeFilter = includeInactive ? '' : 'AND active = TRUE';
+  const result = await query<Quest>(
+    `SELECT * FROM quests WHERE guild_id = $1 ${activeFilter} ORDER BY created_at DESC`,
+    [guildId]
+  );
+  return result.rows;
+}
+
+export async function updateQuestStatus(questId: string, active: boolean): Promise<void> {
+  await query(`UPDATE quests SET active = $1, updated_at = NOW() WHERE id = $2`, [active, questId]);
+}
+
+export async function incrementQuestCompletions(questId: string): Promise<void> {
+  await query(
+    `UPDATE quests SET total_completions = total_completions + 1, updated_at = NOW() WHERE id = $1`,
+    [questId]
+  );
+}
+
+export async function deleteQuest(questId: string): Promise<void> {
+  await query(`DELETE FROM quests WHERE id = $1`, [questId]);
+}
+
+// ==================== User Quests ====================
+
+export async function assignQuestToUser(
+  userId: string,
+  guildId: string,
+  questId: string
+): Promise<UserQuest> {
+  const result = await query<UserQuest>(
+    `INSERT INTO user_quests (user_id, guild_id, quest_id, status)
+     VALUES ($1, $2, $3, 'assigned')
+     RETURNING *`,
+    [userId, guildId, questId]
+  );
+  return result.rows[0];
+}
+
+export async function getUserActiveQuest(userId: string, guildId: string): Promise<UserQuestWithDetails | null> {
+  const result = await query<UserQuestWithDetails>(
+    `SELECT uq.*, q.name as quest_name, q.description as quest_description,
+            q.xp_reward, q.verification_type, q.api_endpoint, q.api_method,
+            q.api_headers, q.api_params, q.success_condition, q.user_input_description,
+            q.connector_id, q.connector_name, q.api_key_env_var, q.user_input_placeholder
+     FROM user_quests uq
+     JOIN quests q ON uq.quest_id = q.id
+     WHERE uq.user_id = $1 AND uq.guild_id = $2 AND uq.status = 'assigned'
+     ORDER BY uq.assigned_at DESC
+     LIMIT 1`,
+    [userId, guildId]
+  );
+  return result.rows[0] || null;
+}
+
+export async function getUserCompletedQuests(
+  userId: string,
+  guildId: string,
+  limit: number = 50
+): Promise<UserQuestWithDetails[]> {
+  const result = await query<UserQuestWithDetails>(
+    `SELECT uq.*, q.name as quest_name, q.description as quest_description, q.xp_reward
+     FROM user_quests uq
+     JOIN quests q ON uq.quest_id = q.id
+     WHERE uq.user_id = $1 AND uq.guild_id = $2 AND uq.status = 'completed'
+     ORDER BY uq.completed_at DESC
+     LIMIT $3`,
+    [userId, guildId, limit]
+  );
+  return result.rows;
+}
+
+export async function getUserCompletedQuestIds(userId: string, guildId: string): Promise<string[]> {
+  const result = await query<{ quest_id: string }>(
+    `SELECT DISTINCT quest_id FROM user_quests
+     WHERE user_id = $1 AND guild_id = $2 AND status = 'completed'`,
+    [userId, guildId]
+  );
+  return result.rows.map(r => r.quest_id);
+}
+
+export async function completeUserQuest(
+  userQuestId: string,
+  xpAwarded: number,
+  verificationIdentifier?: string
+): Promise<UserQuest> {
+  const result = await query<UserQuest>(
+    `UPDATE user_quests
+     SET status = 'completed', completed_at = NOW(), xp_awarded = $1, verification_identifier = $2
+     WHERE id = $3
+     RETURNING *`,
+    [xpAwarded, verificationIdentifier, userQuestId]
+  );
+  return result.rows[0];
+}
+
+export async function failUserQuest(userQuestId: string, reason: string): Promise<UserQuest> {
+  const result = await query<UserQuest>(
+    `UPDATE user_quests
+     SET status = 'failed', failure_reason = $1
+     WHERE id = $2
+     RETURNING *`,
+    [reason, userQuestId]
+  );
+  return result.rows[0];
+}
+
+export async function incrementVerificationAttempts(userQuestId: string): Promise<number> {
+  const result = await query<{ verification_attempts: number }>(
+    `UPDATE user_quests
+     SET verification_attempts = verification_attempts + 1
+     WHERE id = $1
+     RETURNING verification_attempts`,
+    [userQuestId]
+  );
+  return result.rows[0]?.verification_attempts || 0;
+}
+
+// ==================== User XP ====================
+
+export async function getUserXp(userId: string, guildId: string): Promise<UserXp | null> {
+  const result = await query<UserXp>(
+    `SELECT * FROM user_xp WHERE user_id = $1 AND guild_id = $2`,
+    [userId, guildId]
+  );
+  return result.rows[0] || null;
+}
+
+export async function addUserXp(
+  userId: string,
+  guildId: string,
+  xpAmount: number
+): Promise<UserXp> {
+  const result = await query<UserXp>(
+    `INSERT INTO user_xp (user_id, guild_id, total_xp, quests_completed, last_quest_at)
+     VALUES ($1, $2, $3, 1, NOW())
+     ON CONFLICT (user_id, guild_id)
+     DO UPDATE SET
+       total_xp = user_xp.total_xp + $3,
+       quests_completed = user_xp.quests_completed + 1,
+       last_quest_at = NOW(),
+       updated_at = NOW()
+     RETURNING *`,
+    [userId, guildId, xpAmount]
+  );
+  return result.rows[0];
+}
+
+export async function getGuildLeaderboard(guildId: string, limit: number = 10): Promise<UserXp[]> {
+  const result = await query<UserXp>(
+    `SELECT * FROM user_xp
+     WHERE guild_id = $1 AND total_xp > 0
+     ORDER BY total_xp DESC
+     LIMIT $2`,
+    [guildId, limit]
+  );
+  return result.rows;
+}
+
+// ==================== Quest Conversations ====================
+
+export async function getQuestConversation(
+  userId: string,
+  guildId: string
+): Promise<QuestConversation | null> {
+  const result = await query<QuestConversation>(
+    `SELECT * FROM quest_conversations
+     WHERE user_id = $1 AND guild_id = $2 AND expires_at > NOW()
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [userId, guildId]
+  );
+  return result.rows[0] || null;
+}
+
+export async function upsertQuestConversation(
+  userId: string,
+  guildId: string,
+  channelId: string | null,
+  conversationState: Record<string, unknown>,
+  messages: Array<{ role: string; content: string }>
+): Promise<QuestConversation> {
+  const result = await query<QuestConversation>(
+    `INSERT INTO quest_conversations (user_id, guild_id, channel_id, conversation_state, messages, expires_at)
+     VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '1 hour')
+     ON CONFLICT (user_id, guild_id)
+     DO UPDATE SET
+       channel_id = EXCLUDED.channel_id,
+       conversation_state = EXCLUDED.conversation_state,
+       messages = EXCLUDED.messages,
+       expires_at = NOW() + INTERVAL '1 hour',
+       updated_at = NOW()
+     RETURNING *`,
+    [userId, guildId, channelId, JSON.stringify(conversationState), JSON.stringify(messages)]
+  );
+  return result.rows[0];
+}
+
+export async function deleteQuestConversation(userId: string, guildId: string): Promise<void> {
+  await query(`DELETE FROM quest_conversations WHERE user_id = $1 AND guild_id = $2`, [
+    userId,
+    guildId,
+  ]);
+}
+
+export async function cleanupExpiredConversations(): Promise<number> {
+  const result = await query(`DELETE FROM quest_conversations WHERE expires_at < NOW()`);
+  return result.rowCount || 0;
+}
+
+// ==================== Transactional Operations ====================
+
+/**
+ * Complete a quest with all related updates in a single transaction
+ * Ensures consistency between user_quests, quests, and user_xp tables
+ */
+export async function completeQuestTransaction(
+  userQuestId: string,
+  questId: string,
+  userId: string,
+  guildId: string,
+  xpReward: number,
+  verificationIdentifier?: string
+): Promise<UserXp> {
+  return transaction(async (client) => {
+    // 1. Mark user quest as completed
+    await client.query(
+      `UPDATE user_quests
+       SET status = 'completed', completed_at = NOW(), xp_awarded = $1, verification_identifier = $2
+       WHERE id = $3`,
+      [xpReward, verificationIdentifier, userQuestId]
+    );
+
+    // 2. Increment quest total completions
+    await client.query(
+      `UPDATE quests SET total_completions = total_completions + 1, updated_at = NOW() WHERE id = $1`,
+      [questId]
+    );
+
+    // 3. Add XP to user and return updated XP
+    const xpResult = await client.query<UserXp>(
+      `INSERT INTO user_xp (user_id, guild_id, total_xp, quests_completed, last_quest_at)
+       VALUES ($1, $2, $3, 1, NOW())
+       ON CONFLICT (user_id, guild_id)
+       DO UPDATE SET
+         total_xp = user_xp.total_xp + $3,
+         quests_completed = user_xp.quests_completed + 1,
+         last_quest_at = NOW(),
+         updated_at = NOW()
+       RETURNING *`,
+      [userId, guildId, xpReward]
+    );
+
+    return xpResult.rows[0];
+  });
 }

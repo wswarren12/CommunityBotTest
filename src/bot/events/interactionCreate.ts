@@ -1,6 +1,9 @@
 import { Interaction } from 'discord.js';
 import { logger } from '../../utils/logger';
 import { handleCatchupCommand } from '../../commands/catchup';
+import { execute as handleQuestCommand } from '../../commands/quest';
+import { execute as handleConfirmCommand } from '../../commands/confirm';
+import { execute as handleXpCommand } from '../../commands/xp';
 
 /**
  * Handle all interactions (slash commands, buttons, etc.)
@@ -18,6 +21,15 @@ export async function handleInteractionCreate(interaction: Interaction): Promise
       switch (interaction.commandName) {
         case 'catchup':
           await handleCatchupCommand(interaction);
+          break;
+        case 'quest':
+          await handleQuestCommand(interaction);
+          break;
+        case 'confirm':
+          await handleConfirmCommand(interaction);
+          break;
+        case 'xp':
+          await handleXpCommand(interaction);
           break;
         default:
           logger.warn('Unknown command', { command: interaction.commandName });

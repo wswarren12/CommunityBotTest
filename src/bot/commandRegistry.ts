@@ -14,6 +14,25 @@ const commands = [
         .setDescription('Custom timeframe (e.g., "1h", "6h", "1d")')
         .setRequired(false)
     ),
+  new SlashCommandBuilder()
+    .setName('quest')
+    .setDescription('Get a quest assigned to you and earn XP!')
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('confirm')
+    .setDescription('Confirm your quest completion')
+    .setDMPermission(false)
+    .addStringOption((option) =>
+      option
+        .setName('identifier')
+        .setDescription('Your email, wallet address, Twitter handle, or other verification info')
+        .setRequired(true)
+        .setMaxLength(200)
+    ),
+  new SlashCommandBuilder()
+    .setName('xp')
+    .setDescription('View your XP and completed quests')
+    .setDMPermission(false),
 ].map((command) => command.toJSON());
 
 /**
