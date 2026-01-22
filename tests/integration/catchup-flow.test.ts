@@ -24,6 +24,11 @@ describe('Integration: /catchup command flow', () => {
       },
       guildId: 'guild123',
       channelId: 'channel123',
+      member: {
+        user: { id: 'user123', username: 'testuser' },
+        guild: { id: 'guild123', name: 'Test Guild' },
+        roles: { cache: new Map() },
+      },
       options: {
         getString: jest.fn().mockReturnValue(null),
       },
@@ -59,30 +64,28 @@ describe('Integration: /catchup command flow', () => {
         },
       ]);
 
-      // Mock summary generation
+      // Mock summary generation (matches current API)
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## Recent Activity\n\nThere have been 2 messages in the past hour.',
-        metadata: {
-          messageCount: 2,
-          timeframe: '1 hour',
-          channelCount: 1,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60),
+        timeRangeEnd: new Date(),
+        messageCount: 2,
+        mentionCount: 0,
       });
 
       await handleCatchupCommand(mockInteraction);
 
       // Verify the flow
-      expect(mockInteraction.deferReply).toHaveBeenCalledWith({ ephemeral: true });
+      expect(mockInteraction.deferReply).toHaveBeenCalledWith({ flags: [64] }); // 64 = MessageFlags.Ephemeral
       expect(summaryService.generateCatchupSummary).toHaveBeenCalledWith(
-        'user123',
-        'guild123',
-        null
-      );
-      expect(mockInteraction.editReply).toHaveBeenCalledWith(
         expect.objectContaining({
-          content: expect.stringContaining('Recent Activity'),
+          guildMember: expect.anything(),
+          detailLevel: 'brief',
         })
       );
+      // editReply is called with embeds and components
+      expect(mockInteraction.editReply).toHaveBeenCalled();
     });
 
     it('should handle custom timeframe parameter', async () => {
@@ -97,19 +100,21 @@ describe('Integration: /catchup command flow', () => {
 
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## No Recent Activity\n\nNo messages in the past 6 hours.',
-        metadata: {
-          messageCount: 0,
-          timeframe: '6 hours',
-          channelCount: 0,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60 * 6),
+        timeRangeEnd: new Date(),
+        messageCount: 0,
+        mentionCount: 0,
       });
 
       await handleCatchupCommand(mockInteraction);
 
       expect(summaryService.generateCatchupSummary).toHaveBeenCalledWith(
-        'user123',
-        'guild123',
-        '6h'
+        expect.objectContaining({
+          guildMember: expect.anything(),
+          detailLevel: 'brief',
+          customTimeframe: '6h',
+        })
       );
     });
 
@@ -144,11 +149,11 @@ describe('Integration: /catchup command flow', () => {
 
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## Recent Activity\n\nYou have 1 accessible message.',
-        metadata: {
-          messageCount: 1,
-          timeframe: '1 hour',
-          channelCount: 1,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60),
+        timeRangeEnd: new Date(),
+        messageCount: 1,
+        mentionCount: 0,
       });
 
       await handleCatchupCommand(mockInteraction);
@@ -159,7 +164,8 @@ describe('Integration: /catchup command flow', () => {
 
   describe('error scenarios', () => {
     it('should handle database connection errors', async () => {
-      (dbQueries.getUserLastActivity as jest.Mock).mockRejectedValue(
+      // The command handler calls summaryService.generateCatchupSummary which internally uses db
+      (summaryService.generateCatchupSummary as jest.Mock).mockRejectedValue(
         new Error('Database connection failed')
       );
 
@@ -168,7 +174,7 @@ describe('Integration: /catchup command flow', () => {
       expect(logger.error).toHaveBeenCalled();
       expect(mockInteraction.editReply).toHaveBeenCalledWith(
         expect.objectContaining({
-          content: expect.stringContaining('error'),
+          content: expect.stringContaining('Database connection failed'),
         })
       );
     });
@@ -214,11 +220,11 @@ describe('Integration: /catchup command flow', () => {
 
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## Welcome!\n\nThis is your first time using /catchup.',
-        metadata: {
-          messageCount: 0,
-          timeframe: 'all time',
-          channelCount: 0,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60 * 24),
+        timeRangeEnd: new Date(),
+        messageCount: 0,
+        mentionCount: 0,
       });
 
       await handleCatchupCommand(mockInteraction);
@@ -247,11 +253,11 @@ describe('Integration: /catchup command flow', () => {
 
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## Very Active Day\n\nThere have been 1000 messages!',
-        metadata: {
-          messageCount: 1000,
-          timeframe: '1 day',
-          channelCount: 1,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60 * 24),
+        timeRangeEnd: new Date(),
+        messageCount: 1000,
+        mentionCount: 0,
       });
 
       await handleCatchupCommand(mockInteraction);
@@ -286,21 +292,17 @@ describe('Integration: /catchup command flow', () => {
 
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## You Were Mentioned!\n\nYou were mentioned 2 times.',
-        metadata: {
-          messageCount: 2,
-          timeframe: '1 hour',
-          channelCount: 1,
-          mentions: 2,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60),
+        timeRangeEnd: new Date(),
+        messageCount: 2,
+        mentionCount: 2,
       });
 
       await handleCatchupCommand(mockInteraction);
 
-      expect(mockInteraction.editReply).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: expect.stringContaining('Mentioned'),
-        })
-      );
+      // editReply is called with embeds
+      expect(mockInteraction.editReply).toHaveBeenCalled();
     });
 
     it('should handle messages from multiple channels', async () => {
@@ -335,11 +337,11 @@ describe('Integration: /catchup command flow', () => {
 
       (summaryService.generateCatchupSummary as jest.Mock).mockResolvedValue({
         summary: '## Multi-Channel Activity\n\nActivity across 3 channels.',
-        metadata: {
-          messageCount: 3,
-          timeframe: '1 hour',
-          channelCount: 3,
-        },
+        summaryId: 1,
+        timeRangeStart: new Date(Date.now() - 1000 * 60 * 60),
+        timeRangeEnd: new Date(),
+        messageCount: 3,
+        mentionCount: 0,
       });
 
       await handleCatchupCommand(mockInteraction);

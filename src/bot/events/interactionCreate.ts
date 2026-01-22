@@ -4,6 +4,7 @@ import { handleCatchupCommand } from '../../commands/catchup';
 import { execute as handleQuestCommand } from '../../commands/quest';
 import { execute as handleConfirmCommand } from '../../commands/confirm';
 import { execute as handleXpCommand } from '../../commands/xp';
+import { execute as handleQuestDebugCommand } from '../../commands/questdebug';
 
 /**
  * Handle all interactions (slash commands, buttons, etc.)
@@ -30,6 +31,9 @@ export async function handleInteractionCreate(interaction: Interaction): Promise
           break;
         case 'xp':
           await handleXpCommand(interaction);
+          break;
+        case 'questdebug':
+          await handleQuestDebugCommand(interaction);
           break;
         default:
           logger.warn('Unknown command', { command: interaction.commandName });

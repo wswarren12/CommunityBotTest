@@ -74,6 +74,122 @@ export interface CreateConnectorResult {
 }
 
 /**
+ * Tag definition for quests
+ */
+export interface QuestTag {
+  name: string;
+  color: string;
+  tagTypeId: number;
+}
+
+/**
+ * Task definition for creating/updating quest tasks
+ */
+export interface QuestTaskDefinition {
+  id?: number;
+  mcpConnectorId?: number;
+  title: string;
+  description?: string;
+  imageUrl?: string;
+  points?: number;
+  seasonPoints?: number;
+  maxCompletions?: number;
+  maxCompletionsPerDay?: number;
+}
+
+/**
+ * Quest dependency definition
+ */
+export interface QuestDependency {
+  dependsOnQuestId: number;
+}
+
+/**
+ * Quest status enum matching Summon MCP
+ */
+export type QuestStatus = 'LIVE' | 'DRAFT' | 'READY' | 'ARCHIVED' | 'SCHEDULED' | 'ENDED' | 'PAUSED';
+
+/**
+ * Quest definition for creating/updating quests
+ */
+export interface QuestDefinition {
+  id?: number;
+  campaignId?: number;
+  title: string;
+  description?: string;
+  imageUrl?: string;
+  appUrl?: string;
+  points?: number;
+  seasonPoints?: number;
+  startAt?: string;
+  endAt?: string;
+  isFeatured?: boolean;
+  isOnboarding?: boolean;
+  tags?: QuestTag[];
+  tasks?: QuestTaskDefinition[];
+  questDependencies?: QuestDependency[];
+}
+
+/**
+ * Result from creating/updating a quest
+ */
+export interface CreateQuestResult {
+  id: number;
+  title: string;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Quest list filter parameters
+ */
+export interface ListQuestsParams {
+  title?: string;
+  startDate?: string;
+  endDate?: string;
+  status?: QuestStatus;
+  withCampaigns?: boolean;
+  isFeatured?: boolean;
+  isOnboarding?: boolean;
+}
+
+/**
+ * Quest data returned from MCP
+ */
+export interface MCPQuest {
+  id: number;
+  title: string;
+  description?: string;
+  imageUrl?: string;
+  appUrl?: string;
+  points?: number;
+  seasonPoints?: number;
+  startAt?: string;
+  endAt?: string;
+  status: QuestStatus;
+  isFeatured?: boolean;
+  isOnboarding?: boolean;
+  tasks?: MCPTask[];
+  tags?: QuestTag[];
+  questDependencies?: QuestDependency[];
+}
+
+/**
+ * Task data returned from MCP
+ */
+export interface MCPTask {
+  id: number;
+  title: string;
+  description?: string;
+  imageUrl?: string;
+  points?: number;
+  seasonPoints?: number;
+  maxCompletions?: number;
+  maxCompletionsPerDay?: number;
+  mcpConnectorId?: number;
+}
+
+/**
  * MCP Client for Quest Builder
  */
 class MCPClient {
@@ -297,6 +413,218 @@ class MCPClient {
         isValid: false,
         error: `Connection error: ${errorMessage}`,
       };
+    }
+  }
+
+  /**
+   * Create or update a quest in the Summon MCP
+   */
+  async createOrUpdateQuest(
+    definition: QuestDefinition
+  ): Promise<CreateQuestResult> {
+    try {
+      const client = await this.ensureConnected();
+
+      logger.info('Creating/updating quest via MCP', {
+        id: definition.id,
+        title: definition.title,
+        taskCount: definition.tasks?.length || 0,
+      });
+
+      const result = await client.callTool({
+        name: 'createOrUpdateQuest',
+        arguments: definition as unknown as Record<string, unknown>,
+      });
+
+      // Parse the result
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content.type === 'text' && content.text) {
+        const parsed = JSON.parse(content.text);
+        // Handle nested response format (API returns { quest: {...} })
+        const questData = parsed.quest || parsed;
+        logger.info('Quest created/updated successfully', {
+          questId: questData.id,
+          title: questData.title,
+        });
+        return {
+          id: questData.id,
+          title: questData.title || definition.title,
+          success: true,
+        };
+      }
+
+      throw new Error('Unexpected response format from MCP');
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to create/update quest', { error: errorMessage });
+      return {
+        id: 0,
+        title: definition.title,
+        success: false,
+        error: errorMessage,
+      };
+    }
+  }
+
+  /**
+   * List quests from the Summon MCP
+   */
+  async listQuests(params?: ListQuestsParams): Promise<MCPQuest[]> {
+    try {
+      const client = await this.ensureConnected();
+
+      logger.info('Listing quests via MCP', { params });
+
+      const result = await client.callTool({
+        name: 'listQuests',
+        arguments: (params || {}) as unknown as Record<string, unknown>,
+      });
+
+      // Parse the result
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content.type === 'text' && content.text) {
+        const parsed = JSON.parse(content.text);
+        // Handle nested response format
+        const quests = parsed.quests || parsed;
+        logger.info('Quests retrieved successfully', {
+          count: Array.isArray(quests) ? quests.length : 0,
+        });
+        return Array.isArray(quests) ? quests : [];
+      }
+
+      return [];
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to list quests', { error: errorMessage });
+      return [];
+    }
+  }
+
+  /**
+   * Get a quest by ID from the Summon MCP
+   */
+  async getQuestById(id: number): Promise<MCPQuest | null> {
+    try {
+      const client = await this.ensureConnected();
+
+      logger.info('Getting quest by ID via MCP', { id });
+
+      const result = await client.callTool({
+        name: 'getQuestById',
+        arguments: { id } as unknown as Record<string, unknown>,
+      });
+
+      // Parse the result
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content.type === 'text' && content.text) {
+        const parsed = JSON.parse(content.text);
+        // Handle nested response format
+        const questData = parsed.quest || parsed;
+        logger.info('Quest retrieved successfully', {
+          questId: questData.id,
+          title: questData.title,
+        });
+        return questData as MCPQuest;
+      }
+
+      return null;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to get quest by ID', { id, error: errorMessage });
+      return null;
+    }
+  }
+
+  /**
+   * Update quest status in the Summon MCP
+   */
+  async updateQuestStatus(
+    id: number,
+    status: 'READY' | 'LIVE' | 'PAUSED'
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const client = await this.ensureConnected();
+
+      logger.info('Updating quest status via MCP', { id, status });
+
+      const result = await client.callTool({
+        name: 'updateQuestStatus',
+        arguments: { id, status } as unknown as Record<string, unknown>,
+      });
+
+      // Parse the result
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content.type === 'text' && content.text) {
+        logger.info('Quest status updated successfully', { id, status });
+        return { success: true };
+      }
+
+      return { success: true };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to update quest status', { id, status, error: errorMessage });
+      return { success: false, error: errorMessage };
+    }
+  }
+
+  /**
+   * Delete a quest in the Summon MCP
+   */
+  async deleteQuest(id: number): Promise<{ success: boolean; error?: string }> {
+    try {
+      const client = await this.ensureConnected();
+
+      logger.info('Deleting quest via MCP', { id });
+
+      await client.callTool({
+        name: 'deleteQuest',
+        arguments: { id } as unknown as Record<string, unknown>,
+      });
+
+      logger.info('Quest deleted successfully', { id });
+      return { success: true };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to delete quest', { id, error: errorMessage });
+      return { success: false, error: errorMessage };
+    }
+  }
+
+  /**
+   * List available tags from the Summon MCP
+   */
+  async listTags(): Promise<QuestTag[]> {
+    try {
+      const client = await this.ensureConnected();
+
+      logger.info('Listing tags via MCP');
+
+      const result = await client.callTool({
+        name: 'listTags',
+        arguments: {},
+      });
+
+      // Parse the result
+      const contentArray = result.content as Array<{ type: string; text?: string }>;
+      const content = contentArray[0];
+      if (content.type === 'text' && content.text) {
+        const parsed = JSON.parse(content.text);
+        const tags = parsed.tags || parsed;
+        logger.info('Tags retrieved successfully', {
+          count: Array.isArray(tags) ? tags.length : 0,
+        });
+        return Array.isArray(tags) ? tags : [];
+      }
+
+      return [];
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to list tags', { error: errorMessage });
+      return [];
     }
   }
 

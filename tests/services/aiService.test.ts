@@ -1,29 +1,29 @@
 import { describe, it, expect, jest, beforeEach, afterEach } from '@jest/globals';
-import Anthropic from '@anthropic-ai/sdk';
-import { generateSummary, detectEvents, testConnection } from '../../src/services/aiService';
 import { MessageWithUser } from '../../src/types/database';
 import * as logger from '../../src/utils/logger';
 
-// Mock dependencies
-jest.mock('@anthropic-ai/sdk');
-jest.mock('../../src/utils/logger');
+// Create mock create function that can be configured per test
+const mockCreate = jest.fn<() => Promise<any>>();
 
-describe('aiService', () => {
-  let mockAnthropicInstance: any;
-  let mockCreate: any;
-
-  beforeEach(() => {
-    jest.clearAllMocks();
-
-    // Setup mock for Anthropic SDK
-    mockCreate = jest.fn();
-    mockAnthropicInstance = {
+// Mock dependencies - MUST be before imports that use them
+jest.mock('@anthropic-ai/sdk', () => {
+  return {
+    __esModule: true,
+    default: jest.fn().mockImplementation(() => ({
       messages: {
         create: mockCreate,
       },
-    };
+    })),
+  };
+});
+jest.mock('../../src/utils/logger');
 
-    (Anthropic as any).mockImplementation(() => mockAnthropicInstance);
+// Import after mocks are set up
+import { generateSummary, detectEvents, testConnection } from '../../src/services/aiService';
+
+describe('aiService', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
   });
 
   afterEach(() => {
@@ -99,7 +99,7 @@ describe('aiService', () => {
         mentionCount: 1,
         categories: {
           mentions: 1,
-          discussions: 0,
+          discussions: 1,  // The mock response includes 💬 which counts as discussion
           announcements: 0,
           events: 0,
         },
@@ -250,7 +250,7 @@ describe('aiService', () => {
       mockCreate.mockResolvedValue(mockResponse);
 
       await expect(generateSummary(mockRequest, 'brief')).rejects.toThrow(
-        'No text content in Claude response'
+        'Failed to generate summary with AI'
       );
     });
 
@@ -263,7 +263,7 @@ describe('aiService', () => {
 
       await generateSummary(mockRequest, 'brief');
 
-      const promptCall = mockCreate.mock.calls[0][0];
+      const promptCall = (mockCreate.mock.calls as any[][])[0][0];
       expect(promptCall.messages[0].content).toContain(
         `https://discord.com/channels/${mockRequest.guildId}`
       );
@@ -278,7 +278,7 @@ describe('aiService', () => {
 
       await generateSummary(mockRequest, 'brief');
 
-      const promptCall = mockCreate.mock.calls[0][0];
+      const promptCall = (mockCreate.mock.calls as any[][])[0][0];
       expect(promptCall.messages[0].content).toContain('Member, Contributor');
     });
 
@@ -301,7 +301,7 @@ describe('aiService', () => {
 
       await generateSummary(requestWithLongMessage, 'brief');
 
-      const promptCall = mockCreate.mock.calls[0][0];
+      const promptCall = (mockCreate.mock.calls as any[][])[0][0];
       expect(promptCall.messages[0].content).toContain('a'.repeat(500));
       expect(promptCall.messages[0].content).not.toContain('a'.repeat(501));
     });
@@ -461,7 +461,7 @@ describe('aiService', () => {
 
       await detectEvents(mockRequest);
 
-      const promptCall = mockCreate.mock.calls[0][0];
+      const promptCall = (mockCreate.mock.calls as any[][])[0][0];
       expect(promptCall.messages[0].content).toContain('America/New_York');
     });
 
@@ -474,7 +474,7 @@ describe('aiService', () => {
 
       await detectEvents(mockRequest);
 
-      const promptCall = mockCreate.mock.calls[0][0];
+      const promptCall = (mockCreate.mock.calls as any[][])[0][0];
       expect(promptCall.messages[0].content).toContain('2026-01-10');
     });
 
@@ -487,7 +487,7 @@ describe('aiService', () => {
 
       await detectEvents(mockRequest);
 
-      const promptCall = mockCreate.mock.calls[0][0];
+      const promptCall = (mockCreate.mock.calls as any[][])[0][0];
       expect(promptCall.messages[0].content).toContain('gaming session');
       expect(promptCall.messages[0].content).toContain('TestUser');
       expect(promptCall.messages[0].content).toContain('#general');

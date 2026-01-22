@@ -67,9 +67,10 @@ describe('commandRegistry', () => {
       const putCall = mockRest.put.mock.calls[0];
       const commands = putCall[1].body;
 
-      expect(commands).toHaveLength(1);
-      expect(commands[0].name).toBe('catchup');
-      expect(commands[0].description).toBe(
+      // Find the catchup command among all registered commands
+      const catchupCommand = commands.find((cmd: any) => cmd.name === 'catchup');
+      expect(catchupCommand).toBeDefined();
+      expect(catchupCommand.description).toBe(
         'Get a personalized summary of activity since your last message'
       );
     });
@@ -138,7 +139,8 @@ describe('commandRegistry', () => {
     it('should handle non-Error objects in API failure', async () => {
       mockRest.put.mockRejectedValue('String error');
 
-      await expect(registerCommands(mockClient)).rejects.toThrow();
+      // When a non-Error is thrown, Jest's toThrow() doesn't work - use toBe instead
+      await expect(registerCommands(mockClient)).rejects.toBe('String error');
 
       expect(logger.error).toHaveBeenCalledWith('Failed to register commands', {
         error: 'Unknown error',
@@ -205,7 +207,8 @@ describe('commandRegistry', () => {
     it('should handle non-Error objects in API failure', async () => {
       mockRest.put.mockRejectedValue('String error');
 
-      await expect(unregisterCommands()).rejects.toThrow();
+      // When a non-Error is thrown, Jest's toThrow() doesn't work - use toBe instead
+      await expect(unregisterCommands()).rejects.toBe('String error');
 
       expect(logger.error).toHaveBeenCalledWith('Failed to unregister commands', {
         error: 'Unknown error',

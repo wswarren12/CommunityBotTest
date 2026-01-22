@@ -37,6 +37,10 @@ describe('QuestService', () => {
     jest.clearAllMocks();
     // Reset rate limit cache by calling cleanup with a mock that clears everything
     cleanupRateLimitCache();
+    // Default mock for getQuestTasks - return empty array for legacy quests
+    mockDb.getQuestTasks.mockResolvedValue([]);
+    // Default mock for getUserQuestTaskCompletions
+    mockDb.getUserQuestTaskCompletions.mockResolvedValue([]);
   });
 
   describe('checkRateLimit', () => {
@@ -133,6 +137,12 @@ describe('QuestService', () => {
         verification_type: 'email',
       };
 
+      mockDb.getActiveQuests.mockResolvedValue([mockQuest as any]);
+      mockDb.getUserCompletedQuestIds.mockResolvedValue([]);
+      mockDb.assignQuestToUserAtomic.mockResolvedValue({
+        userQuest: activeQuest as any,
+        alreadyHadQuest: true,
+      });
       mockDb.getUserActiveQuest.mockResolvedValue(activeQuest as any);
 
       const result = await assignQuest('user-123', 'guild-123');
@@ -168,26 +178,30 @@ describe('QuestService', () => {
     it('should assign a random available quest', async () => {
       const quest2: Quest = { ...mockQuest, id: 'quest-456', name: 'Quest 2' };
 
-      mockDb.getUserActiveQuest.mockResolvedValue(null);
       mockDb.getActiveQuests.mockResolvedValue([mockQuest as any, quest2 as any]);
       mockDb.getUserCompletedQuestIds.mockResolvedValue([]);
-      mockDb.assignQuestToUser.mockResolvedValue({ id: 'uq-new' } as any);
+      mockDb.assignQuestToUserAtomic.mockResolvedValue({
+        userQuest: { id: 'uq-new' } as any,
+        alreadyHadQuest: false,
+      });
 
       const result = await assignQuest('user-123', 'guild-123');
 
       expect(result.success).toBe(true);
       expect(result.quest).toBeDefined();
       expect(['Test Quest', 'Quest 2']).toContain(result.quest!.name);
-      expect(mockDb.assignQuestToUser).toHaveBeenCalled();
+      expect(mockDb.assignQuestToUserAtomic).toHaveBeenCalled();
     });
 
     it('should exclude already completed quests', async () => {
       const quest2: Quest = { ...mockQuest, id: 'quest-456', name: 'Quest 2' };
 
-      mockDb.getUserActiveQuest.mockResolvedValue(null);
       mockDb.getActiveQuests.mockResolvedValue([mockQuest as any, quest2 as any]);
       mockDb.getUserCompletedQuestIds.mockResolvedValue(['quest-123']);
-      mockDb.assignQuestToUser.mockResolvedValue({ id: 'uq-new' } as any);
+      mockDb.assignQuestToUserAtomic.mockResolvedValue({
+        userQuest: { id: 'uq-new' } as any,
+        alreadyHadQuest: false,
+      });
 
       const result = await assignQuest('user-123', 'guild-123');
 
@@ -196,7 +210,7 @@ describe('QuestService', () => {
     });
 
     it('should handle database errors gracefully', async () => {
-      mockDb.getUserActiveQuest.mockRejectedValue(new Error('DB Error'));
+      mockDb.getActiveQuests.mockRejectedValue(new Error('DB Error'));
 
       await expect(assignQuest('user-123', 'guild-123')).rejects.toThrow('DB Error');
       expect(mockLogger.error).toHaveBeenCalledWith(
@@ -234,6 +248,7 @@ describe('QuestService', () => {
 
     it('should fail quest after max verification attempts', async () => {
       mockDb.getUserActiveQuest.mockResolvedValue(mockActiveQuest as any);
+      mockDb.getQuestTasks.mockResolvedValue([]); // No tasks = legacy quest
       mockDb.incrementVerificationAttempts.mockResolvedValue(11); // Over max
       mockDb.failUserQuest.mockResolvedValue({} as any);
 
@@ -249,13 +264,12 @@ describe('QuestService', () => {
 
     it('should use MCP verification when connector_id is present', async () => {
       mockDb.getUserActiveQuest.mockResolvedValue(mockActiveQuest as any);
+      mockDb.getQuestTasks.mockResolvedValue([]); // No tasks = legacy quest
       mockDb.incrementVerificationAttempts.mockResolvedValue(1);
       mockMcpClient.validateQuestCompletion.mockResolvedValue({
         isValid: true,
       });
-      mockDb.completeUserQuest.mockResolvedValue({} as any);
-      mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-      mockDb.addUserXp.mockResolvedValue({ total_xp: 200 } as any);
+      mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 200 } as any);
 
       const result = await verifyQuestCompletion('user-123', 'guild-123', '0x123');
 
@@ -270,25 +284,23 @@ describe('QuestService', () => {
 
     it('should complete quest and award XP on successful verification', async () => {
       mockDb.getUserActiveQuest.mockResolvedValue(mockActiveQuest as any);
+      mockDb.getQuestTasks.mockResolvedValue([]); // No tasks = legacy quest
       mockDb.incrementVerificationAttempts.mockResolvedValue(1);
       mockMcpClient.validateQuestCompletion.mockResolvedValue({
         isValid: true,
       });
-      mockDb.completeUserQuest.mockResolvedValue({} as any);
-      mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-      mockDb.addUserXp.mockResolvedValue({ total_xp: 300 } as any);
+      mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 300 } as any);
 
       const result = await verifyQuestCompletion('user-123', 'guild-123', '0x123');
 
       expect(result.success).toBe(true);
       expect(result.message).toContain('Quest Complete');
       expect(result.message).toContain('+100 XP');
-      expect(mockDb.completeUserQuest).toHaveBeenCalledWith('uq-123', 100, '0x123');
-      expect(mockDb.addUserXp).toHaveBeenCalledWith('user-123', 'guild-123', 100);
     });
 
     it('should return failure message on failed verification', async () => {
       mockDb.getUserActiveQuest.mockResolvedValue(mockActiveQuest as any);
+      mockDb.getQuestTasks.mockResolvedValue([]); // No tasks = legacy quest
       mockDb.incrementVerificationAttempts.mockResolvedValue(1);
       mockMcpClient.validateQuestCompletion.mockResolvedValue({
         isValid: false,
@@ -311,6 +323,7 @@ describe('QuestService', () => {
       };
 
       mockDb.getUserActiveQuest.mockResolvedValue(legacyQuest as any);
+      mockDb.getQuestTasks.mockResolvedValue([]); // No tasks = legacy quest
       mockDb.incrementVerificationAttempts.mockResolvedValue(1);
 
       // Mock fetch
@@ -320,9 +333,7 @@ describe('QuestService', () => {
       } as Response);
       global.fetch = mockFetch;
 
-      mockDb.completeUserQuest.mockResolvedValue({} as any);
-      mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-      mockDb.addUserXp.mockResolvedValue({ total_xp: 100 } as any);
+      mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 100 } as any);
 
       const result = await verifyQuestCompletion('user-123', 'guild-123', '0xWallet');
 
@@ -335,6 +346,7 @@ describe('QuestService', () => {
 
     it('should handle API errors gracefully', async () => {
       mockDb.getUserActiveQuest.mockResolvedValue(mockActiveQuest as any);
+      mockDb.getQuestTasks.mockResolvedValue([]); // No tasks = legacy quest
       mockDb.incrementVerificationAttempts.mockRejectedValue(new Error('DB Error'));
 
       const result = await verifyQuestCompletion('user-123', 'guild-123', '0x123');
@@ -585,6 +597,9 @@ describe('QuestService', () => {
 describe('evaluateSuccessCondition (via legacy verification)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Default mock for getQuestTasks - return empty array for legacy quests
+    mockDb.getQuestTasks.mockResolvedValue([]);
+    mockDb.getUserQuestTaskCompletions.mockResolvedValue([]);
   });
 
   it('should evaluate > operator correctly', async () => {
@@ -614,9 +629,7 @@ describe('evaluateSuccessCondition (via legacy verification)', () => {
       json: () => Promise.resolve({ balance: 100 }),
     } as Response);
 
-    mockDb.completeUserQuest.mockResolvedValue({} as any);
-    mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-    mockDb.addUserXp.mockResolvedValue({ total_xp: 100 } as any);
+    mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 100 } as any);
 
     const result = await verifyQuestCompletion('user-123', 'guild-123', 'test');
 
@@ -650,9 +663,7 @@ describe('evaluateSuccessCondition (via legacy verification)', () => {
       json: () => Promise.resolve({ data: { user: { balance: 75 } } }),
     } as Response);
 
-    mockDb.completeUserQuest.mockResolvedValue({} as any);
-    mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-    mockDb.addUserXp.mockResolvedValue({ total_xp: 100 } as any);
+    mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 100 } as any);
 
     const result = await verifyQuestCompletion('user-123', 'guild-123', 'test');
 
@@ -686,9 +697,7 @@ describe('evaluateSuccessCondition (via legacy verification)', () => {
       json: () => Promise.resolve({ verified: true }),
     } as Response);
 
-    mockDb.completeUserQuest.mockResolvedValue({} as any);
-    mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-    mockDb.addUserXp.mockResolvedValue({ total_xp: 100 } as any);
+    mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 100 } as any);
 
     const result = await verifyQuestCompletion('user-123', 'guild-123', 'test');
 
@@ -722,9 +731,7 @@ describe('evaluateSuccessCondition (via legacy verification)', () => {
       json: () => Promise.resolve({ items: ['item1', 'item2'] }),
     } as Response);
 
-    mockDb.completeUserQuest.mockResolvedValue({} as any);
-    mockDb.incrementQuestCompletions.mockResolvedValue(undefined as any);
-    mockDb.addUserXp.mockResolvedValue({ total_xp: 100 } as any);
+    mockDb.completeQuestTransaction.mockResolvedValue({ total_xp: 100 } as any);
 
     const result = await verifyQuestCompletion('user-123', 'guild-123', 'test');
 

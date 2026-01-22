@@ -1,6 +1,7 @@
 /**
  * Quest Creation Service
  * Handles conversational quest creation with admins using AI
+ * Supports Discord-native quests, MCP connectors, and legacy API quests
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -8,18 +9,23 @@ import { Message, Guild, GuildMember, PermissionFlagsBits } from 'discord.js';
 import { logger } from '../utils/logger';
 import { QUEST_BUILDER_SYSTEM_PROMPT, QUEST_CREATION_PERMISSION_DENIED } from '../utils/prompts';
 import * as db from '../db/queries';
-import { VerificationType, SuccessCondition } from '../types/database';
+import { VerificationType, SuccessCondition, DiscordVerificationConfig, isDiscordNativeVerification } from '../types/database';
 import {
   mcpClient,
   ConnectorDefinition,
   getPlaceholderForVerificationType,
+  QuestTaskDefinition,
 } from './mcpClient';
+import { CreateTaskParams } from '../types/database';
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022';
+
+// Maximum number of messages to keep in conversation history to prevent unbounded growth
+const MAX_CONVERSATION_MESSAGES = 50;
 
 // Keywords that trigger quest creation mode
 const QUEST_CREATION_TRIGGERS = [
@@ -39,11 +45,17 @@ const CANCEL_KEYWORDS = ['cancel', 'stop', 'nevermind', 'never mind', 'quit', 'e
 /**
  * Check if a user has admin/moderator permissions in a guild
  * Uses Discord permission flags only (not role names) for security
+ * Also grants access to the server owner automatically
  */
 export async function hasAdminPermissions(
   member: GuildMember | null
 ): Promise<boolean> {
   if (!member) return false;
+
+  // Check if user is the server owner (always has permission)
+  if (member.id === member.guild.ownerId) {
+    return true;
+  }
 
   // Check for administrator permission
   if (member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -104,35 +116,43 @@ export async function handleQuestCreationMessage(
     // Get or create conversation
     let conversation = await db.getQuestConversation(userId, guildId);
 
+    // Build conversation messages - always work with a copy to avoid mutations
+    let conversationMessages: Array<{ role: string; content: string }>;
+
     if (!conversation) {
       // Start new conversation
+      conversationMessages = [{ role: 'user', content }];
       conversation = await db.upsertQuestConversation(
         userId,
         guildId,
         message.channelId,
         { phase: 'gathering_details' },
-        [{ role: 'user', content }]
+        conversationMessages
       );
     } else {
-      // Add to existing conversation
-      const messages = Array.isArray(conversation.messages)
-        ? conversation.messages
-        : [];
-      messages.push({ role: 'user', content });
+      // Add to existing conversation - create a new array, don't mutate the original
+      conversationMessages = Array.isArray(conversation.messages)
+        ? [...conversation.messages, { role: 'user', content }]
+        : [{ role: 'user', content }];
+
+      // Apply limit BEFORE saving to DB to prevent unbounded database growth
+      if (conversationMessages.length > MAX_CONVERSATION_MESSAGES) {
+        conversationMessages = conversationMessages.slice(-MAX_CONVERSATION_MESSAGES);
+        logger.debug('Trimmed conversation history before save', {
+          userId,
+          guildId,
+          trimmedTo: MAX_CONVERSATION_MESSAGES,
+        });
+      }
 
       conversation = await db.upsertQuestConversation(
         userId,
         guildId,
         message.channelId,
         conversation.conversation_state,
-        messages
+        conversationMessages
       );
     }
-
-    // Build conversation history for Claude
-    const conversationMessages = Array.isArray(conversation.messages)
-      ? conversation.messages
-      : [];
 
     // Call Claude to continue the conversation
     const response = await anthropic.messages.create({
@@ -153,7 +173,195 @@ export async function handleQuestCreationMessage(
     // Check if quest is ready to be created
     const questData = extractQuestDataFromResponse(assistantResponse, conversation.conversation_state);
 
-    if (questData && questData.isComplete && questData.connectorDefinition) {
+    // Handle multi-task quest creation
+    if (questData && questData.isComplete && questData.tasks && questData.tasks.length > 0) {
+      try {
+        logger.info('Creating multi-task quest via MCP', {
+          questName: questData.name,
+          taskCount: questData.tasks.length,
+          guildId,
+        });
+
+        // Step 1: Create connectors for each task that needs one
+        const tasksWithConnectors: CreateTaskParams[] = [];
+        const mcpTasks: QuestTaskDefinition[] = [];
+
+        for (let i = 0; i < questData.tasks.length; i++) {
+          const task = questData.tasks[i];
+          let connectorId: number | undefined;
+          let connectorName: string | undefined;
+
+          // Create connector if task has a connector definition
+          if (task.connectorDefinition) {
+            logger.info('Creating connector for task', {
+              taskTitle: task.title,
+              connectorName: task.connectorDefinition.name,
+            });
+
+            const connectorResult = await mcpClient.createOrUpdateConnector(task.connectorDefinition);
+
+            if (!connectorResult.success) {
+              logger.error('Failed to create connector for task', {
+                taskTitle: task.title,
+                error: connectorResult.error,
+              });
+              return `${assistantResponse}\n\n❌ Failed to create connector for task "${task.title}": ${connectorResult.error}. Please try again.`;
+            }
+
+            connectorId = connectorResult.id;
+            connectorName = connectorResult.name;
+
+            logger.info('Connector created for task', {
+              taskTitle: task.title,
+              connectorId,
+              connectorName,
+            });
+          }
+
+          // Build task params for local database
+          tasksWithConnectors.push({
+            title: task.title,
+            description: task.description,
+            points: task.points,
+            connectorId,
+            connectorName,
+            verificationType: task.verificationType,
+            discordVerificationConfig: task.discordVerificationConfig,
+            position: i,
+          });
+
+          // Build MCP task definition
+          mcpTasks.push({
+            title: task.title,
+            description: task.description,
+            points: task.points,
+            mcpConnectorId: connectorId,
+          });
+        }
+
+        // Step 2: Create the quest in Summon MCP
+        const mcpQuestResult = await mcpClient.createOrUpdateQuest({
+          title: questData.name!,
+          description: questData.description,
+          points: questData.xpReward,
+          tasks: mcpTasks,
+        });
+
+        if (!mcpQuestResult.success) {
+          logger.error('Failed to create quest in Summon MCP', {
+            questName: questData.name,
+            error: mcpQuestResult.error,
+          });
+          return `${assistantResponse}\n\n❌ Failed to create quest in Summon: ${mcpQuestResult.error}. Please try again.`;
+        }
+
+        logger.info('Quest created in Summon MCP', {
+          summonQuestId: mcpQuestResult.id,
+          questName: mcpQuestResult.title,
+        });
+
+        // Step 3: Create quest with tasks in local database
+        const quest = await db.createQuestWithTasks({
+          guildId,
+          name: questData.name!,
+          description: questData.description!,
+          xpReward: questData.xpReward!,
+          verificationType: tasksWithConnectors[0]?.verificationType || 'wallet_address',
+          summonQuestId: mcpQuestResult.id,
+          summonStatus: 'DRAFT',
+          tasks: tasksWithConnectors,
+          active: true,
+          createdBy: userId,
+        });
+
+        // Clean up conversation
+        await db.deleteQuestConversation(userId, guildId);
+
+        logger.info('Multi-task quest created successfully', {
+          questId: quest.id,
+          questName: quest.name,
+          summonQuestId: mcpQuestResult.id,
+          taskCount: quest.tasks.length,
+          guildId,
+          createdBy: userId,
+        });
+
+        // Build task summary for response
+        const taskSummary = quest.tasks
+          .map((t, i) => `${i + 1}. **${t.title}** - ${t.points} XP`)
+          .join('\n');
+
+        return `${assistantResponse}\n\n✅ **Quest "${quest.name}" has been created and is now active!**\n\n` +
+          `**Summon Quest ID:** ${mcpQuestResult.id}\n` +
+          `**Total XP:** ${quest.xp_reward} XP\n\n` +
+          `**Tasks:**\n${taskSummary}\n\n` +
+          `Users can receive this quest via the \`/quest\` command and complete tasks with \`/confirm\`.`;
+      } catch (createError) {
+        const errorMessage = createError instanceof Error ? createError.message : 'Unknown error';
+        logger.error('Failed to create multi-task quest', {
+          createError,
+          questData,
+          errorMessage,
+          guildId,
+          userId,
+        });
+
+        return `${assistantResponse}\n\n❌ There was an error creating the quest: ${errorMessage}. Please try again or contact support.`;
+      }
+    } else if (questData && questData.isComplete && questData.discordVerificationConfig && isDiscordNativeVerification(questData.verificationType!)) {
+      // Create Discord-native quest (no external API needed)
+      try {
+        logger.info('Creating Discord-native quest', {
+          questName: questData.name,
+          verificationType: questData.verificationType,
+          guildId,
+        });
+
+        const quest = await db.createQuest({
+          guildId,
+          name: questData.name!,
+          description: questData.description!,
+          xpReward: questData.xpReward!,
+          verificationType: questData.verificationType!,
+          discordVerificationConfig: questData.discordVerificationConfig,
+          active: true,
+          createdBy: userId,
+        });
+
+        // Clean up conversation
+        await db.deleteQuestConversation(userId, guildId);
+
+        logger.info('Discord-native quest created via conversation', {
+          questId: quest.id,
+          questName: quest.name,
+          verificationType: questData.verificationType,
+          guildId,
+          createdBy: userId,
+        });
+
+        return `${assistantResponse}\n\n✅ **Quest "${quest.name}" has been created and is now active!**\n\n` +
+          `**Verification Type:** ${questData.verificationType}\n` +
+          `**XP Reward:** ${quest.xp_reward} XP\n` +
+          `Users can receive this quest via the \`/quest\` command and complete it with \`/confirm\`.`;
+      } catch (createError) {
+        const errorMessage = createError instanceof Error ? createError.message : 'Unknown error';
+        logger.error('Failed to create Discord-native quest', {
+          createError,
+          questData,
+          errorMessage,
+          guildId,
+          userId,
+        });
+
+        let userErrorMessage = '❌ There was an error creating the quest.';
+        if (errorMessage.includes('violates check constraint')) {
+          // Don't expose database constraint details to users - security risk
+          userErrorMessage = '❌ Invalid quest configuration. Please check your quest parameters and try again.';
+        }
+
+        return `${assistantResponse}\n\n${userErrorMessage} Please try again or contact support.`;
+      }
+    } else if (questData && questData.isComplete && questData.connectorDefinition) {
       // Create quest with MCP connector
       try {
         // First, create the connector via MCP
@@ -204,8 +412,25 @@ export async function handleQuestCreationMessage(
           `**Connector ID:** ${connectorResult.id}\n` +
           `Users can receive this quest via the \`/quest\` command.`;
       } catch (createError) {
-        logger.error('Failed to create quest from conversation', { createError, questData });
-        return `${assistantResponse}\n\n❌ There was an error creating the quest. Please try again or contact support.`;
+        const errorMessage = createError instanceof Error ? createError.message : 'Unknown error';
+        logger.error('Failed to create quest from conversation (MCP)', {
+          createError,
+          questData,
+          errorMessage,
+          guildId,
+          userId,
+        });
+
+        // Provide more specific error feedback without exposing internal details
+        let userErrorMessage = '❌ There was an error creating the quest.';
+        if (errorMessage.includes('null value') && errorMessage.includes('api_endpoint')) {
+          userErrorMessage = '❌ Database schema issue: Please run `npm run migrate` to update the database schema, then try again.';
+        } else if (errorMessage.includes('violates check constraint')) {
+          // Don't expose database constraint details to users - security risk
+          userErrorMessage = '❌ Invalid quest configuration. Please check your quest parameters and try again.';
+        }
+
+        return `${assistantResponse}\n\n${userErrorMessage} Please try again or contact support.`;
       }
     } else if (questData && questData.isComplete) {
       // Legacy: Create quest without MCP (direct API)
@@ -238,8 +463,25 @@ export async function handleQuestCreationMessage(
 
         return `${assistantResponse}\n\n✅ **Quest "${quest.name}" has been created and is now active!** Users can receive it via the \`/quest\` command.`;
       } catch (createError) {
-        logger.error('Failed to create quest from conversation', { createError, questData });
-        return `${assistantResponse}\n\n❌ There was an error creating the quest. Please try again or contact support.`;
+        const errorMessage = createError instanceof Error ? createError.message : 'Unknown error';
+        logger.error('Failed to create quest from conversation (legacy)', {
+          createError,
+          questData,
+          errorMessage,
+          guildId,
+          userId,
+        });
+
+        // Provide more specific error feedback without exposing internal details
+        let userErrorMessage = '❌ There was an error creating the quest.';
+        if (errorMessage.includes('null value')) {
+          userErrorMessage = '❌ Database schema issue: Please run `npm run migrate` to update the database schema, then try again.';
+        } else if (errorMessage.includes('violates check constraint')) {
+          // Don't expose database constraint details to users - security risk
+          userErrorMessage = '❌ Invalid quest configuration. Please check your quest parameters and try again.';
+        }
+
+        return `${assistantResponse}\n\n${userErrorMessage} Please try again or contact support.`;
       }
     } else {
       // Update conversation state with any partial quest data
@@ -274,7 +516,7 @@ export async function hasActiveConversation(userId: string, guildId: string): Pr
 
 /**
  * Extract quest data from Claude's response
- * Supports both MCP connector definitions and legacy API configurations
+ * Supports quest_definition format with tasks, Discord-native configs, MCP connector definitions, and legacy API configurations
  */
 function extractQuestDataFromResponse(
   response: string,
@@ -282,9 +524,83 @@ function extractQuestDataFromResponse(
 ): Partial<QuestDataExtraction> | null {
   const result: Partial<QuestDataExtraction> = { ...currentState };
 
-  // Try to extract MCP connector definition (marked with ```connector)
+  // Try to extract complete quest definition with tasks (marked with ```quest_definition)
+  const questDefinitionMatch = response.match(/```quest_definition\s*([\s\S]*?)\s*```/);
+  if (questDefinitionMatch) {
+    try {
+      const questDef = JSON.parse(questDefinitionMatch[1]);
+      if (questDef.name) result.name = questDef.name;
+      if (questDef.description) result.description = questDef.description;
+
+      // Extract tasks if present
+      if (questDef.tasks && Array.isArray(questDef.tasks) && questDef.tasks.length > 0) {
+        result.tasks = [];
+        let totalXp = 0;
+
+        for (const task of questDef.tasks) {
+          if (!task.title || typeof task.points !== 'number') continue;
+
+          const extractedTask: TaskDataExtraction = {
+            title: task.title,
+            description: task.description,
+            points: task.points,
+            verificationType: task.verificationType,
+          };
+
+          // Handle connector definition for external API tasks
+          if (task.connectorDefinition && isValidConnectorDefinition(task.connectorDefinition)) {
+            extractedTask.connectorDefinition = task.connectorDefinition;
+          }
+
+          // Handle Discord verification config
+          if (task.discordVerificationConfig && isValidDiscordConfig(task.discordVerificationConfig)) {
+            extractedTask.discordVerificationConfig = task.discordVerificationConfig;
+          }
+
+          result.tasks.push(extractedTask);
+          totalXp += task.points;
+        }
+
+        // Set total XP from sum of task points
+        if (!result.xpReward && totalXp > 0) {
+          result.xpReward = totalXp;
+        }
+
+        logger.debug('Extracted quest definition with tasks', {
+          name: result.name,
+          taskCount: result.tasks.length,
+          totalXp,
+        });
+      }
+    } catch (err) {
+      logger.debug('Failed to parse quest definition', {
+        match: questDefinitionMatch[1].substring(0, 200),
+        error: err instanceof Error ? err.message : 'Unknown error',
+      });
+    }
+  }
+
+  // Try to extract Discord-native config (marked with ```discord_config) - legacy single-task format
+  const discordConfigMatch = response.match(/```discord_config\s*([\s\S]*?)\s*```/);
+  if (discordConfigMatch && !result.tasks) {
+    try {
+      const discordConfig = JSON.parse(discordConfigMatch[1]);
+      if (isValidDiscordConfig(discordConfig)) {
+        result.discordVerificationConfig = discordConfig as DiscordVerificationConfig;
+        // Set verification type from config
+        if (discordConfig.verificationType) {
+          result.verificationType = discordConfig.verificationType as VerificationType;
+        }
+        logger.debug('Extracted Discord verification config', { config: discordConfig });
+      }
+    } catch {
+      logger.debug('Failed to parse Discord config', { match: discordConfigMatch[1].substring(0, 100) });
+    }
+  }
+
+  // Try to extract MCP connector definition (marked with ```connector) - legacy single-task format
   const connectorMatch = response.match(/```connector\s*([\s\S]*?)\s*```/);
-  if (connectorMatch) {
+  if (connectorMatch && !result.tasks) {
     try {
       const connectorDef = JSON.parse(connectorMatch[1]) as ConnectorDefinition;
       if (isValidConnectorDefinition(connectorDef)) {
@@ -293,22 +609,37 @@ function extractQuestDataFromResponse(
         if (!result.name && connectorDef.name) {
           result.name = connectorDef.name;
         }
+        // Extract description from connector if not already set
+        if (!result.description && connectorDef.description) {
+          result.description = connectorDef.description;
+        }
       }
     } catch {
       logger.debug('Failed to parse connector definition', { match: connectorMatch[1].substring(0, 100) });
     }
   }
 
-  // Try to extract JSON configuration (could be connector or legacy format)
+  // Try to extract JSON configuration (could be Discord config, connector, or legacy format)
   const jsonMatches = response.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/g);
   for (const jsonMatch of jsonMatches) {
     try {
       const parsed = JSON.parse(jsonMatch[1]);
 
+      // Check if this looks like a Discord verification config
+      if (parsed.verificationType && isDiscordNativeVerification(parsed.verificationType)) {
+        if (isValidDiscordConfig(parsed)) {
+          result.discordVerificationConfig = parsed as DiscordVerificationConfig;
+          result.verificationType = parsed.verificationType as VerificationType;
+        }
+      }
       // Check if this looks like an MCP connector definition
-      if (parsed.endpoint && parsed.method && (parsed.validationFn || parsed.validationPrompt)) {
+      else if (parsed.endpoint && parsed.method && (parsed.validationFn || parsed.validationPrompt)) {
         if (isValidConnectorDefinition(parsed)) {
           result.connectorDefinition = parsed as ConnectorDefinition;
+          // Extract description from connector
+          if (!result.description && parsed.description) {
+            result.description = parsed.description;
+          }
         }
       }
 
@@ -322,6 +653,14 @@ function extractQuestDataFromResponse(
       if (parsed.api_key_env_var || parsed.apiKeyEnvVar) {
         result.apiKeyEnvVar = parsed.api_key_env_var || parsed.apiKeyEnvVar;
       }
+
+      // Discord verification config fields
+      if (parsed.roleId) result.discordVerificationConfig = { ...result.discordVerificationConfig, roleId: parsed.roleId };
+      if (parsed.roleName) result.discordVerificationConfig = { ...result.discordVerificationConfig, roleName: parsed.roleName };
+      if (parsed.threshold !== undefined) result.discordVerificationConfig = { ...result.discordVerificationConfig, threshold: parsed.threshold };
+      if (parsed.operator) result.discordVerificationConfig = { ...result.discordVerificationConfig, operator: parsed.operator };
+      if (parsed.sinceDays !== undefined) result.discordVerificationConfig = { ...result.discordVerificationConfig, sinceDays: parsed.sinceDays };
+      if (parsed.channelId) result.discordVerificationConfig = { ...result.discordVerificationConfig, channelId: parsed.channelId };
 
       // Legacy API fields (for backwards compatibility)
       if (parsed.api_endpoint || parsed.apiEndpoint) result.apiEndpoint = parsed.api_endpoint || parsed.apiEndpoint;
@@ -342,8 +681,44 @@ function extractQuestDataFromResponse(
   // Extract quest details from text if not found in JSON
   extractQuestDetailsFromText(response, result);
 
-  // Check if we have all required fields for MCP-based quest
+  // Check if we have all required fields for multi-task quest
   if (
+    result.tasks &&
+    result.tasks.length > 0 &&
+    result.name &&
+    result.description &&
+    result.xpReward
+  ) {
+    // Verify each task has required fields
+    const allTasksValid = result.tasks.every(task =>
+      task.title &&
+      typeof task.points === 'number' &&
+      (task.connectorDefinition || task.discordVerificationConfig || task.verificationType)
+    );
+
+    if (allTasksValid) {
+      result.isComplete = true;
+      logger.debug('Quest data complete (Multi-task)', {
+        name: result.name,
+        taskCount: result.tasks.length,
+        totalXp: result.xpReward,
+      });
+    }
+  }
+  // Check if we have all required fields for Discord-native quest (legacy single-task)
+  else if (
+    result.discordVerificationConfig &&
+    result.name &&
+    result.description &&
+    result.xpReward &&
+    result.verificationType &&
+    isDiscordNativeVerification(result.verificationType)
+  ) {
+    result.isComplete = true;
+    logger.debug('Quest data complete (Discord-native)', { name: result.name, verificationType: result.verificationType });
+  }
+  // Check if we have all required fields for MCP-based quest (legacy single-task)
+  else if (
     result.connectorDefinition &&
     result.name &&
     result.description &&
@@ -351,6 +726,7 @@ function extractQuestDataFromResponse(
     result.verificationType
   ) {
     result.isComplete = true;
+    logger.debug('Quest data complete (MCP)', { name: result.name, verificationType: result.verificationType });
   }
   // Check if we have all required fields for legacy quest
   else if (
@@ -361,9 +737,41 @@ function extractQuestDataFromResponse(
     result.apiEndpoint
   ) {
     result.isComplete = true;
+    logger.debug('Quest data complete (Legacy)', { name: result.name, verificationType: result.verificationType });
   }
 
   return Object.keys(result).length > 0 ? result : null;
+}
+
+/**
+ * Validate that an object is a valid Discord verification config
+ * Note: The parsed JSON may include verificationType which gets extracted separately
+ */
+function isValidDiscordConfig(obj: unknown): boolean {
+  if (!obj || typeof obj !== 'object') return false;
+  const config = obj as Record<string, unknown>;
+
+  // Check if it has a valid Discord verification type (may be in the config or extracted separately)
+  const verificationType = config.verificationType as string | undefined;
+  if (verificationType) {
+    // Verify it's a valid Discord-native type
+    const validTypes = ['discord_role', 'discord_message_count', 'discord_reaction_count', 'discord_poll_count'];
+    if (!validTypes.includes(verificationType)) {
+      return false;
+    }
+
+    // For role verification, need roleId
+    if (verificationType === 'discord_role' && !config.roleId) {
+      return false;
+    }
+  }
+
+  // Check for valid config fields
+  const hasRoleConfig = config.roleId !== undefined;
+  const hasCountConfig = config.threshold !== undefined || config.sinceDays !== undefined;
+
+  // Must have at least some Discord config
+  return hasRoleConfig || hasCountConfig || verificationType !== undefined;
 }
 
 /**
@@ -447,20 +855,36 @@ export function getPermissionDeniedMessage(): string {
   return QUEST_CREATION_PERMISSION_DENIED;
 }
 
+/**
+ * Task data extracted from AI response
+ */
+interface TaskDataExtraction {
+  title: string;
+  description?: string;
+  points: number;
+  verificationType?: VerificationType;
+  connectorDefinition?: ConnectorDefinition;
+  discordVerificationConfig?: DiscordVerificationConfig;
+}
+
 interface QuestDataExtraction {
   name?: string;
   description?: string;
   xpReward?: number;
   verificationType?: VerificationType;
-  // Legacy direct API fields
+  // Tasks array for multi-task quests
+  tasks?: TaskDataExtraction[];
+  // Legacy direct API fields (for backwards compatibility)
   apiEndpoint?: string;
   apiMethod?: string;
   apiHeaders?: Record<string, string>;
   apiParams?: Record<string, unknown>;
   successCondition?: SuccessCondition;
-  // MCP Connector fields
+  // MCP Connector fields (legacy - single connector)
   connectorDefinition?: ConnectorDefinition;
   apiKeyEnvVar?: string;
   userInputDescription?: string;
+  // Discord-native verification fields (legacy - single config)
+  discordVerificationConfig?: DiscordVerificationConfig;
   isComplete?: boolean;
 }

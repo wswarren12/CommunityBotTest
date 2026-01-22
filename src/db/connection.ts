@@ -91,12 +91,13 @@ export async function getClient(): Promise<PoolClient> {
 }
 
 /**
- * Execute a transaction
+ * Execute a transaction with proper rollback verification
  */
 export async function transaction<T>(
   callback: (client: PoolClient) => Promise<T>
 ): Promise<T> {
   const client = await getClient();
+  let clientReleased = false;
 
   try {
     await client.query('BEGIN');
@@ -104,13 +105,30 @@ export async function transaction<T>(
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
-    logger.error('Transaction rolled back', {
-      error: error instanceof Error ? error.message : 'Unknown error',
-    });
+    // Attempt rollback with error handling
+    try {
+      await client.query('ROLLBACK');
+      logger.error('Transaction rolled back successfully', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    } catch (rollbackError) {
+      // Rollback failed - connection may be dead
+      // Log both errors for debugging
+      logger.error('Transaction rollback failed - connection may be compromised', {
+        originalError: error instanceof Error ? error.message : 'Unknown error',
+        rollbackError: rollbackError instanceof Error ? rollbackError.message : 'Unknown rollback error',
+      });
+      // Force destroy the connection to prevent reuse of a potentially bad connection
+      client.release(true); // true = destroy the client
+      clientReleased = true;
+      throw error; // Re-throw original error
+    }
     throw error;
   } finally {
-    client.release();
+    // Release client back to pool only if not already destroyed
+    if (!clientReleased) {
+      client.release();
+    }
   }
 }
 

@@ -1,4 +1,4 @@
-import { Client, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { Client, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
 import { logger } from '../utils/logger';
 
 /**
@@ -32,6 +32,11 @@ const commands = [
   new SlashCommandBuilder()
     .setName('xp')
     .setDescription('View your XP and completed quests')
+    .setDMPermission(false),
+  new SlashCommandBuilder()
+    .setName('questdebug')
+    .setDescription('Debug: Check quest status in this server (admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .setDMPermission(false),
 ].map((command) => command.toJSON());
 

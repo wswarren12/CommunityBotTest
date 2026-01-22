@@ -1,7 +1,10 @@
 /**
  * Quest Service
  * Handles quest assignment, verification, and XP management
- * Supports both MCP-based verification (via connector_id) and legacy direct API calls
+ * Supports:
+ * - MCP-based verification (via connector_id)
+ * - Legacy direct API calls
+ * - Discord-native verification (roles, message counts, reactions, polls)
  */
 
 import { logger } from '../utils/logger';
@@ -11,12 +14,15 @@ import {
   UserXp,
   SuccessCondition,
   CreateQuestParams,
+  DiscordVerificationConfig,
 } from '../types/database';
 import * as db from '../db/queries';
 import {
   QUEST_ASSIGNMENT_TEMPLATE,
+  QUEST_WITH_TASKS_ASSIGNMENT_TEMPLATE,
   QUEST_COMPLETION_SUCCESS_TEMPLATE,
   QUEST_COMPLETION_FAILURE_TEMPLATE,
+  TASK_COMPLETION_SUCCESS_TEMPLATE,
   XP_PROGRESS_TEMPLATE,
   NO_QUESTS_AVAILABLE_TEMPLATE,
   ACTIVE_QUEST_EXISTS_TEMPLATE,
@@ -24,12 +30,64 @@ import {
   RATE_LIMIT_TEMPLATE,
 } from '../utils/prompts';
 import { mcpClient } from './mcpClient';
+import {
+  verifyDiscordRequirement,
+  isDiscordNativeVerificationType,
+} from './discordVerificationService';
 
 // Rate limiting configuration
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const MAX_RATE_LIMIT_ENTRIES = 10000;
 const RATE_LIMIT_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Valid operators for Discord verification config
+const VALID_OPERATORS = ['>', '>=', '=', '<', '<='] as const;
+
+/**
+ * Validate and sanitize Discord verification config from database
+ * Prevents runtime errors from malformed JSON data
+ */
+function validateDiscordVerificationConfig(config: unknown): DiscordVerificationConfig {
+  if (!config || typeof config !== 'object') {
+    return {};
+  }
+
+  const c = config as Record<string, unknown>;
+  const validated: DiscordVerificationConfig = {};
+
+  // Validate roleId - must be a string if present
+  if (typeof c.roleId === 'string' && c.roleId.length > 0) {
+    validated.roleId = c.roleId;
+  }
+
+  // Validate roleName - must be a string if present
+  if (typeof c.roleName === 'string' && c.roleName.length > 0) {
+    validated.roleName = c.roleName;
+  }
+
+  // Validate threshold - must be a positive number if present
+  if (typeof c.threshold === 'number' && c.threshold > 0 && Number.isFinite(c.threshold)) {
+    validated.threshold = Math.floor(c.threshold);
+  }
+
+  // Validate operator - must be one of the valid operators
+  if (typeof c.operator === 'string' && VALID_OPERATORS.includes(c.operator as typeof VALID_OPERATORS[number])) {
+    validated.operator = c.operator as DiscordVerificationConfig['operator'];
+  }
+
+  // Validate sinceDays - must be a positive number <= 365
+  if (typeof c.sinceDays === 'number' && c.sinceDays > 0 && c.sinceDays <= 365 && Number.isFinite(c.sinceDays)) {
+    validated.sinceDays = Math.floor(c.sinceDays);
+  }
+
+  // Validate channelId - must be a string if present
+  if (typeof c.channelId === 'string' && c.channelId.length > 0) {
+    validated.channelId = c.channelId;
+  }
+
+  return validated;
+}
 const API_TIMEOUT_MS = parseInt(process.env.QUEST_API_TIMEOUT || '10000', 10);
 
 const RATE_LIMITS = {
@@ -45,6 +103,19 @@ const rateLimitCache = new Map<string, { count: number; resetAt: number }>();
 
 // Cleanup interval management
 let cleanupIntervalId: NodeJS.Timeout | null = null;
+let cleanupStarted = false;
+
+/**
+ * Ensure cleanup interval is started (called automatically on first rate limit check)
+ */
+function ensureCleanupStarted(): void {
+  if (!cleanupStarted) {
+    // Lazy-start the cleanup interval
+    cleanupIntervalId = setInterval(() => cleanupRateLimitCache(), RATE_LIMIT_CLEANUP_INTERVAL_MS);
+    cleanupStarted = true;
+    logger.debug('Auto-started rate limit cleanup interval');
+  }
+}
 
 /**
  * Check if a user is rate limited for an action
@@ -53,11 +124,14 @@ export function checkRateLimit(
   userId: string,
   action: keyof typeof RATE_LIMITS
 ): { allowed: boolean; retryAfter?: number } {
+  // Auto-start cleanup on first use to prevent memory leaks
+  ensureCleanupStarted();
+
   const key = `${userId}:${action}`;
   const limit = RATE_LIMITS[action];
   const now = Date.now();
 
-  // Prevent unbounded growth
+  // Prevent unbounded growth with immediate cleanup if too large
   if (rateLimitCache.size > MAX_RATE_LIMIT_ENTRIES) {
     cleanupRateLimitCache();
   }
@@ -86,30 +160,25 @@ export function getRateLimitMessage(command: string, retryAfter: number): string
 
 /**
  * Assign a random quest to a user
+ * Uses atomic database transaction with FOR UPDATE lock to prevent race conditions
  */
 export async function assignQuest(
   userId: string,
   guildId: string
 ): Promise<{ success: boolean; message: string; quest?: Quest }> {
   try {
-    // Check if user already has an active quest
-    const activeQuest = await db.getUserActiveQuest(userId, guildId);
-    if (activeQuest) {
-      return {
-        success: false,
-        message: ACTIVE_QUEST_EXISTS_TEMPLATE({
-          name: activeQuest.quest_name,
-          description: activeQuest.quest_description,
-          xpReward: activeQuest.xp_reward,
-          verificationType: activeQuest.verification_type || 'email',
-          assignedAt: new Date(activeQuest.assigned_at),
-        }),
-      };
-    }
-
-    // Get all active quests
+    // Get all active quests first (can be done outside transaction)
     const allQuests = await db.getActiveQuests(guildId);
+
+    logger.debug('Retrieved active quests for guild', {
+      guildId,
+      questCount: allQuests.length,
+      questIds: allQuests.map(q => q.id),
+      questNames: allQuests.map(q => q.name),
+    });
+
     if (allQuests.length === 0) {
+      logger.info('No active quests found for guild', { guildId });
       return {
         success: false,
         message: NO_QUESTS_AVAILABLE_TEMPLATE,
@@ -137,8 +206,30 @@ export async function assignQuest(
     const randomIndex = Math.floor(Math.random() * availableQuests.length);
     const selectedQuest = availableQuests[randomIndex];
 
-    // Assign the quest to the user
-    await db.assignQuestToUser(userId, guildId, selectedQuest.id);
+    // Use atomic assignment to prevent race conditions
+    // This uses FOR UPDATE SKIP LOCKED to ensure only one quest is assigned
+    const { alreadyHadQuest } = await db.assignQuestToUserAtomic(
+      userId,
+      guildId,
+      selectedQuest.id
+    );
+
+    if (alreadyHadQuest) {
+      // Another request beat us to assigning a quest - get the full details
+      const activeQuest = await db.getUserActiveQuest(userId, guildId);
+      if (activeQuest) {
+        return {
+          success: false,
+          message: ACTIVE_QUEST_EXISTS_TEMPLATE({
+            name: activeQuest.quest_name,
+            description: activeQuest.quest_description,
+            xpReward: activeQuest.xp_reward,
+            verificationType: activeQuest.verification_type || 'email',
+            assignedAt: new Date(activeQuest.assigned_at),
+          }),
+        };
+      }
+    }
 
     logger.info('Quest assigned to user', {
       userId,
@@ -147,6 +238,32 @@ export async function assignQuest(
       questName: selectedQuest.name,
     });
 
+    // Check if quest has tasks
+    const tasks = await db.getQuestTasks(selectedQuest.id);
+
+    if (tasks.length > 0) {
+      // Get user's task completions to show progress
+      const taskCompletions = await db.getUserQuestTaskCompletions(userId, selectedQuest.id);
+      const completedTaskIds = new Set(taskCompletions.map(tc => tc.task_id));
+
+      return {
+        success: true,
+        message: QUEST_WITH_TASKS_ASSIGNMENT_TEMPLATE({
+          name: selectedQuest.name,
+          description: selectedQuest.description,
+          totalXp: selectedQuest.xp_reward,
+          tasks: tasks.map(t => ({
+            title: t.title,
+            description: t.description,
+            points: t.points,
+            isCompleted: completedTaskIds.has(t.id),
+          })),
+        }),
+        quest: selectedQuest,
+      };
+    }
+
+    // Legacy quest without tasks
     return {
       success: true,
       message: QUEST_ASSIGNMENT_TEMPLATE({
@@ -164,12 +281,13 @@ export async function assignQuest(
 }
 
 /**
- * Verify quest completion using MCP or direct API call
+ * Verify task completion for task-based quests
  */
-export async function verifyQuestCompletion(
+export async function verifyTaskCompletion(
   userId: string,
   guildId: string,
-  identifier: string
+  identifier: string,
+  taskId?: string
 ): Promise<{ success: boolean; message: string; xpAwarded?: number }> {
   try {
     // Get user's active quest
@@ -181,6 +299,165 @@ export async function verifyQuestCompletion(
       };
     }
 
+    // Get quest tasks
+    const tasks = await db.getQuestTasks(activeQuest.quest_id);
+
+    if (tasks.length === 0) {
+      // Fall back to legacy verification for quests without tasks
+      return verifyQuestCompletionLegacy(userId, guildId, identifier, activeQuest);
+    }
+
+    // Get user's task completions
+    const completions = await db.getUserQuestTaskCompletions(userId, activeQuest.quest_id);
+    const completedTaskIds = new Set(completions.map(c => c.task_id));
+
+    // Find the next incomplete task, or a specific task if provided
+    let taskToVerify;
+    if (taskId) {
+      taskToVerify = tasks.find(t => t.id === taskId);
+      if (!taskToVerify) {
+        return {
+          success: false,
+          message: 'Task not found.',
+        };
+      }
+      if (completedTaskIds.has(taskId)) {
+        return {
+          success: false,
+          message: `You've already completed the task "${taskToVerify.title}".`,
+        };
+      }
+    } else {
+      // Find the first incomplete task
+      taskToVerify = tasks.find(t => !completedTaskIds.has(t.id));
+      if (!taskToVerify) {
+        return {
+          success: false,
+          message: 'You have already completed all tasks for this quest!',
+        };
+      }
+    }
+
+    // Verify the task
+    let verified: boolean;
+    let verificationMessage: string | undefined;
+
+    // Check if this is a Discord-native verification
+    if (taskToVerify.verification_type && isDiscordNativeVerificationType(taskToVerify.verification_type)) {
+      logger.info('Verifying task via Discord-native', {
+        userId,
+        taskId: taskToVerify.id,
+        verificationType: taskToVerify.verification_type,
+      });
+
+      const config = validateDiscordVerificationConfig(taskToVerify.discord_verification_config);
+      const discordResult = await verifyDiscordRequirement(
+        userId,
+        guildId,
+        taskToVerify.verification_type,
+        config
+      );
+
+      verified = discordResult.verified;
+      verificationMessage = discordResult.message;
+
+    } else if (taskToVerify.connector_id) {
+      // Use MCP-based verification
+      logger.info('Verifying task via MCP', {
+        userId,
+        taskId: taskToVerify.id,
+        connectorId: taskToVerify.connector_id,
+      });
+
+      const mcpResult = await mcpClient.validateQuestCompletion(
+        taskToVerify.connector_id,
+        taskToVerify.verification_type || 'wallet_address',
+        identifier
+      );
+
+      verified = mcpResult.isValid;
+
+      if (mcpResult.error) {
+        logger.warn('MCP task verification returned error', {
+          connectorId: taskToVerify.connector_id,
+          error: mcpResult.error,
+        });
+        verificationMessage = mcpResult.error;
+      }
+    } else {
+      // No verification method configured - auto-pass for now
+      // This handles tasks that don't have external verification
+      logger.warn('Task has no verification method, auto-passing', {
+        taskId: taskToVerify.id,
+        taskTitle: taskToVerify.title,
+      });
+      verified = true;
+    }
+
+    if (verified) {
+      // Complete the task
+      const result = await db.completeTaskTransaction(
+        userId,
+        guildId,
+        taskToVerify.id,
+        activeQuest.quest_id,
+        taskToVerify.points,
+        identifier
+      );
+
+      logger.info('Task completed', {
+        userId,
+        guildId,
+        questId: activeQuest.quest_id,
+        taskId: taskToVerify.id,
+        taskTitle: taskToVerify.title,
+        xpAwarded: taskToVerify.points,
+        allTasksCompleted: result.allTasksCompleted,
+      });
+
+      return {
+        success: true,
+        message: TASK_COMPLETION_SUCCESS_TEMPLATE({
+          taskTitle: taskToVerify.title,
+          xpEarned: taskToVerify.points,
+          totalXp: result.userXp.total_xp,
+          questName: activeQuest.quest_name,
+          tasksCompleted: completions.length + 1,
+          totalTasks: tasks.length,
+          allTasksCompleted: result.allTasksCompleted,
+        }),
+        xpAwarded: taskToVerify.points,
+      };
+    } else {
+      return {
+        success: false,
+        message: QUEST_COMPLETION_FAILURE_TEMPLATE({
+          questName: `${activeQuest.quest_name} - ${taskToVerify.title}`,
+          verificationType: taskToVerify.verification_type || 'identifier',
+          reason: verificationMessage,
+        }),
+      };
+    }
+  } catch (error) {
+    logger.error('Error verifying task completion', { userId, guildId, error });
+    return {
+      success: false,
+      message: 'An error occurred while verifying your task. Please try again later.',
+    };
+  }
+}
+
+/**
+ * Verify quest completion using Discord-native, MCP, or direct API
+ * For legacy quests without tasks
+ */
+async function verifyQuestCompletionLegacy(
+  userId: string,
+  guildId: string,
+  identifier: string,
+  activeQuest: UserQuestWithDetails
+): Promise<{ success: boolean; message: string; xpAwarded?: number }> {
+  try {
     // Check verification attempts
     const attempts = await db.incrementVerificationAttempts(activeQuest.id);
     if (attempts > MAX_VERIFICATION_ATTEMPTS) {
@@ -191,10 +468,34 @@ export async function verifyQuestCompletion(
       };
     }
 
-    // Determine verification method: MCP (connector_id) or legacy (direct API)
+    // Determine verification method
     let verified: boolean;
+    let verificationMethod: string;
+    let verificationMessage: string | undefined;
 
-    if (activeQuest.connector_id) {
+    // Check if this is a Discord-native verification
+    if (activeQuest.verification_type && isDiscordNativeVerificationType(activeQuest.verification_type)) {
+      // Use Discord-native verification
+      logger.info('Verifying quest via Discord-native', {
+        userId,
+        questId: activeQuest.quest_id,
+        verificationType: activeQuest.verification_type,
+      });
+
+      // Validate and sanitize config from database to prevent runtime errors
+      const config = validateDiscordVerificationConfig(activeQuest.discord_verification_config);
+      const discordResult = await verifyDiscordRequirement(
+        userId,
+        guildId,
+        activeQuest.verification_type,
+        config
+      );
+
+      verified = discordResult.verified;
+      verificationMethod = 'discord-native';
+      verificationMessage = discordResult.message;
+
+    } else if (activeQuest.connector_id) {
       // Use MCP-based verification
       logger.info('Verifying quest via MCP', {
         userId,
@@ -209,6 +510,7 @@ export async function verifyQuestCompletion(
       );
 
       verified = mcpResult.isValid;
+      verificationMethod = 'mcp';
 
       if (mcpResult.error) {
         logger.warn('MCP verification returned error', {
@@ -224,6 +526,7 @@ export async function verifyQuestCompletion(
       });
 
       verified = await callVerificationApiLegacy(activeQuest, identifier);
+      verificationMethod = 'legacy';
     }
 
     if (verified) {
@@ -243,7 +546,7 @@ export async function verifyQuestCompletion(
         questId: activeQuest.quest_id,
         xpAwarded: activeQuest.xp_reward,
         totalXp: updatedXp.total_xp,
-        verificationMethod: activeQuest.connector_id ? 'mcp' : 'legacy',
+        verificationMethod,
       });
 
       return {
@@ -257,22 +560,39 @@ export async function verifyQuestCompletion(
       };
     } else {
       const remainingAttempts = MAX_VERIFICATION_ATTEMPTS - attempts;
+      const failureReason = verificationMessage ||
+        `Verification failed. You have ${remainingAttempts} attempt${remainingAttempts !== 1 ? 's' : ''} remaining.`;
+
       return {
         success: false,
         message: QUEST_COMPLETION_FAILURE_TEMPLATE({
           questName: activeQuest.quest_name,
           verificationType: activeQuest.verification_type || 'identifier',
-          reason: `Verification failed. You have ${remainingAttempts} attempt${remainingAttempts !== 1 ? 's' : ''} remaining.`,
+          reason: failureReason,
         }),
       };
     }
   } catch (error) {
-    logger.error('Error verifying quest completion', { userId, guildId, error });
+    logger.error('Error verifying quest completion (legacy)', { userId, guildId, error });
     return {
       success: false,
       message: 'An error occurred while verifying your quest. Please try again later.',
     };
   }
+}
+
+/**
+ * Main entry point for quest/task verification
+ * Dispatches to task verification or legacy quest verification
+ */
+export async function verifyQuestCompletion(
+  userId: string,
+  guildId: string,
+  identifier: string,
+  taskId?: string
+): Promise<{ success: boolean; message: string; xpAwarded?: number }> {
+  // Use task verification which handles both task-based and legacy quests
+  return verifyTaskCompletion(userId, guildId, identifier, taskId);
 }
 
 /**
@@ -438,11 +758,15 @@ export async function getUserProgress(
     ]);
 
     const totalXp = userXp?.total_xp || 0;
-    const formattedCompletedQuests = completedQuests.map(q => ({
-      name: q.quest_name,
-      xp: q.xp_reward,
-      completedAt: new Date(q.completed_at!),
-    }));
+    // Filter out any inconsistent records where completed_at is null
+    // (shouldn't happen but defensive coding against data inconsistency)
+    const formattedCompletedQuests = completedQuests
+      .filter(q => q.completed_at != null)
+      .map(q => ({
+        name: q.quest_name,
+        xp: q.xp_reward,
+        completedAt: new Date(q.completed_at!),
+      }));
 
     const currentQuest = activeQuest
       ? {
@@ -518,7 +842,55 @@ export async function deleteQuest(questId: string): Promise<void> {
  * Get guild leaderboard
  */
 export async function getLeaderboard(guildId: string, limit: number = 10): Promise<UserXp[]> {
-  return db.getGuildLeaderboard(guildId, limit);
+  // Clamp limit to reasonable bounds to prevent performance issues
+  const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 100);
+  return db.getGuildLeaderboard(guildId, safeLimit);
+}
+
+/**
+ * Debug function to get quest status for a guild
+ * Returns counts of active, inactive, and maxed-out quests
+ */
+export async function debugGetQuestStatus(guildId: string): Promise<{
+  total: number;
+  active: number;
+  inactive: number;
+  maxedOut: number;
+  quests: Array<{ id: string; name: string; active: boolean; totalCompletions: number; maxCompletions: number | null }>;
+}> {
+  try {
+    const allQuests = await db.getGuildQuests(guildId, true); // Include inactive
+
+    const result = {
+      total: allQuests.length,
+      active: 0,
+      inactive: 0,
+      maxedOut: 0,
+      quests: allQuests.map(q => ({
+        id: q.id,
+        name: q.name,
+        active: q.active,
+        totalCompletions: q.total_completions,
+        maxCompletions: q.max_completions || null,
+      })),
+    };
+
+    for (const quest of allQuests) {
+      if (!quest.active) {
+        result.inactive++;
+      } else if (quest.max_completions && quest.total_completions >= quest.max_completions) {
+        result.maxedOut++;
+      } else {
+        result.active++;
+      }
+    }
+
+    logger.info('Quest status debug', { guildId, ...result });
+    return result;
+  } catch (error) {
+    logger.error('Error in debugGetQuestStatus', { guildId, error });
+    throw error;
+  }
 }
 
 /**
@@ -557,6 +929,7 @@ export function stopQuestRateLimitCleanup(): void {
   if (cleanupIntervalId) {
     clearInterval(cleanupIntervalId);
     cleanupIntervalId = null;
+    cleanupStarted = false;
     logger.info('Quest rate limit cleanup stopped');
   }
 }

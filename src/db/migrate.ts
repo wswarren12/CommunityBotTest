@@ -7,6 +7,8 @@ import * as migration001 from './migrations/001_initial_schema';
 import * as migration002 from './migrations/002_quest_schema';
 import * as migration003 from './migrations/003_mcp_connector_integration';
 import * as migration004 from './migrations/004_fix_quest_conversations_constraint';
+import * as migration005 from './migrations/005_discord_native_verification';
+import * as migration006 from './migrations/006_quest_tasks_schema';
 
 // Load environment variables
 dotenv.config();
@@ -38,6 +40,16 @@ const migrations: Migration[] = [
     name: '004_fix_quest_conversations_constraint',
     up: async () => migration004.up(getPool()),
     down: async () => migration004.down(getPool()),
+  },
+  {
+    name: '005_discord_native_verification',
+    up: async () => migration005.up(getPool()),
+    down: async () => migration005.down(getPool()),
+  },
+  {
+    name: '006_quest_tasks_schema',
+    up: async () => migration006.up(getPool()),
+    down: async () => migration006.down(getPool()),
   },
 ];
 

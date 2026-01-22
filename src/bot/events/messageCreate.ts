@@ -2,6 +2,7 @@ import { Message, ChannelType } from 'discord.js';
 import { logger } from '../../utils/logger';
 import { ingestMessage } from '../../services/messageService';
 import * as questCreation from '../../services/questCreationService';
+import { trackPollIfPresent } from './pollCreate';
 
 /**
  * Handle new messages for ingestion into database and quest creation
@@ -38,6 +39,9 @@ export async function handleMessageCreate(message: Message): Promise<void> {
   // Normal message ingestion
   try {
     await ingestMessage(message);
+
+    // Track polls for quest verification
+    await trackPollIfPresent(message);
 
     logger.debug('Message ingested', {
       messageId: message.id,

@@ -22,7 +22,11 @@ export async function up(pool: Pool): Promise<void> {
         AND a.created_at < b.created_at
     `);
 
-    // Add unique constraint on (user_id, guild_id)
+    // Add unique constraint on (user_id, guild_id) - drop first if exists
+    await client.query(`
+      ALTER TABLE quest_conversations
+      DROP CONSTRAINT IF EXISTS quest_conversations_user_guild_unique
+    `);
     await client.query(`
       ALTER TABLE quest_conversations
       ADD CONSTRAINT quest_conversations_user_guild_unique

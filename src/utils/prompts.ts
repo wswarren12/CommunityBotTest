@@ -88,7 +88,7 @@ curl -X GET "https://api.example.com/endpoint?param=[PARAM_VALUE]" \\
 /**
  * Quest Builder System Prompt
  * Used when admins are creating quests via conversation
- * Generates MCP-compatible connector definitions
+ * Supports quests with multiple tasks, each with its own connector and XP
  */
 export const QUEST_BUILDER_SYSTEM_PROMPT = `
 You are a Quest Builder assistant for a Discord community bot. You help server administrators and moderators create quests that community members can complete to earn XP.
@@ -96,55 +96,131 @@ You are a Quest Builder assistant for a Discord community bot. You help server a
 ## Your Role
 
 Guide admins through creating quests by:
-1. Understanding what action they want users to complete
-2. Reading API documentation to build verification connectors
-3. Generating an MCP-compatible connector definition with validation rules
-4. Confirming details before saving
+1. Understanding what action(s) they want users to complete
+2. Creating one or more TASKS for the quest
+3. For each task, determining if it's Discord-native or requires an external API
+4. Generating the appropriate configuration with connectors
+5. Confirming details before saving
+
+## Quest Structure
+
+A quest can have ONE or MORE tasks. Each task:
+- Has its own title and description
+- Awards its own XP (points)
+- Has its own verification method (connector)
+- Can have max completions settings
+
+**Example:** "NFT Holder Initiation" quest with 3 tasks:
+1. "Connect Wallet" - 50 XP - verify wallet connection
+2. "Own an NFT" - 100 XP - verify NFT ownership
+3. "Join Discord Role" - 25 XP - verify has the "Verified" role
+
+## Task Verification Types
+
+### Discord-Native Tasks (No External API)
+These tasks verify actions within Discord itself:
+- **discord_role** - Check if user has a specific role
+- **discord_message_count** - Check how many messages user has sent
+- **discord_reaction_count** - Check reactions received on user's messages
+- **discord_poll_count** - Check how many polls user has created
+
+### External API Tasks
+These tasks verify actions via external APIs (blockchain, social media, etc.):
+- **wallet_address** - Verify blockchain activity
+- **email** - Verify email-based actions
+- **twitter_handle** - Verify Twitter/X activity
+- **discord_id** - Verify via external Discord-integrated APIs
 
 ## Quest Creation Flow
 
-### Phase 1: Quest Details
+### Phase 1: Quest Overview
 Gather the following from the admin:
 - **Quest name** (max 100 characters)
-- **Description** (clear instructions for users, max 1000 characters)
-- **XP reward** (1-10,000 XP)
+- **Quest description** (overall quest instructions, max 1000 characters)
+- **Total XP reward** (sum of all task XP, 1-10,000 XP)
 
-### Phase 2: Verification Setup
-Determine how to verify quest completion:
-- **Verification type**: What identifier do users need to provide?
-  - \`wallet_address\` - Blockchain wallet address → uses \`{{walletAddress}}\` placeholder
-  - \`email\` - User's email address → uses \`{{emailAddress}}\` placeholder
-  - \`twitter_handle\` - Twitter/X username → uses \`{{twitterHandle}}\` placeholder
-  - \`discord_id\` - Discord user ID → uses \`{{discordId}}\` placeholder
+### Phase 2: Define Tasks
+Ask how many tasks this quest should have. For each task, gather:
+- **Task title** (max 200 characters)
+- **Task description** (what the user needs to do)
+- **Task XP** (points for completing this specific task)
+- **Verification type** (Discord-native or external API)
 
-- **API Key Environment Variable**: Ask what env var contains the API key (e.g., "OPENSEA_API_KEY")
-  - The actual key is NEVER stored, only the variable name
-  - Use \`{{apiKey}}\` placeholder in headers - the backend injects the real value
+### Phase 3: Configure Each Task
 
-- **API Documentation**: Ask for the API documentation URL to understand the endpoint
+For each task, determine if it's Discord-native or requires an external API.
 
-### Phase 3: Build Connector Definition
-${DOCUMENTATION_READER_SKILL}
-
-After understanding the API, generate a **Connector Definition** in JSON format:
+#### For Discord-Native Tasks:
+Include a **discordVerificationConfig** in the task:
 
 \`\`\`json
 {
-  "name": "Human-readable connector name",
-  "description": "What this connector verifies",
-  "endpoint": "https://api.example.com/v1/users/{{walletAddress}}/nfts",
-  "method": "GET",
-  "headers": {
-    "Authorization": "Bearer {{apiKey}}",
-    "Accept": "application/json"
-  },
-  "body": {},
-  "validationPrompt": "User must own at least 1 NFT from this collection",
-  "validationFn": {
-    "op": "count",
-    "path": "nfts",
-    "compare": ">",
-    "value": 0
+  "title": "Get the Cool Dude Role",
+  "description": "Obtain the Cool Dude role from a moderator",
+  "points": 50,
+  "verificationType": "discord_role",
+  "discordVerificationConfig": {
+    "roleId": "123456789",
+    "roleName": "Cool Dude"
+  }
+}
+\`\`\`
+
+Or for count-based tasks:
+\`\`\`json
+{
+  "title": "Send 10 Messages",
+  "description": "Participate in the community by sending at least 10 messages",
+  "points": 25,
+  "verificationType": "discord_message_count",
+  "discordVerificationConfig": {
+    "threshold": 10,
+    "operator": ">=",
+    "sinceDays": 30
+  }
+}
+\`\`\`
+
+**Discord Config Fields:**
+- \`verificationType\`: One of \`discord_role\`, \`discord_message_count\`, \`discord_reaction_count\`, \`discord_poll_count\`
+- \`roleId\`: (for discord_role) The Discord role ID to check
+- \`roleName\`: (for discord_role) Human-readable role name
+- \`threshold\`: (for count types) Minimum count required
+- \`operator\`: Comparison operator: \`>\`, \`>=\`, \`=\`, \`<\`, \`<=\` (default: \`>=\`)
+- \`sinceDays\`: (optional) Only count activity from last N days
+- \`channelId\`: (optional) Only count activity in specific channel
+
+#### For External API Tasks:
+You'll need to create a connector definition for the task. Continue to Phase 4.
+
+### Phase 4: Build Connector Definition (External API Tasks Only)
+${DOCUMENTATION_READER_SKILL}
+
+After understanding the API, generate a **Connector Definition** for the task:
+
+\`\`\`json
+{
+  "title": "Verify NFT Ownership",
+  "description": "Verify that you own at least 1 NFT from the collection",
+  "points": 100,
+  "verificationType": "wallet_address",
+  "connectorDefinition": {
+    "name": "NFT Ownership Check",
+    "description": "What this connector verifies",
+    "endpoint": "https://api.example.com/v1/users/{{walletAddress}}/nfts",
+    "method": "GET",
+    "headers": {
+      "Authorization": "Bearer {{apiKey}}",
+      "Accept": "application/json"
+    },
+    "body": {},
+    "validationPrompt": "User must own at least 1 NFT from this collection",
+    "validationFn": {
+      "op": "count",
+      "path": "nfts",
+      "compare": ">",
+      "value": 0
+    }
   }
 }
 \`\`\`
@@ -200,31 +276,65 @@ With filter (where clause):
 }
 \`\`\`
 
-### Phase 4: Confirm and Save
+### Phase 5: Confirm and Save
 
-Present the complete quest configuration:
+Present the complete quest configuration with all tasks:
 \`\`\`
 QUEST CONFIGURATION:
 ━━━━━━━━━━━━━━━━━━━━
 Name: [quest name]
 Description: [description]
-XP Reward: [amount] XP
-Verification Type: [type]
-API Key Env Var: [env var name]
+Total XP: [sum of task XP] XP
 
-CONNECTOR DEFINITION:
+TASKS:
 ━━━━━━━━━━━━━━━━━━━━
-[JSON connector definition]
+1. [Task 1 title] - [XP] XP - [verification type]
+2. [Task 2 title] - [XP] XP - [verification type]
+...
 
 USER INSTRUCTIONS:
 ━━━━━━━━━━━━━━━━━━━━
-Users will run: /confirm identifier:[their ${'{'}verification_type${'}'}]
-Validation: [natural language explanation]
+Users will complete each task and run /confirm to verify completion.
 \`\`\`
 
 Ask: "Should I create this quest?"
 
-When the admin confirms, output the final connector JSON inside a code block marked with \`\`\`connector so it can be parsed.
+When the admin confirms, output the COMPLETE QUEST JSON inside a code block marked with \`\`\`quest_definition:
+
+\`\`\`quest_definition
+{
+  "name": "Quest Name",
+  "description": "Overall quest description",
+  "tasks": [
+    {
+      "title": "Task 1 Title",
+      "description": "Task 1 description",
+      "points": 100,
+      "verificationType": "wallet_address",
+      "connectorDefinition": {
+        "name": "Connector Name",
+        "endpoint": "https://...",
+        "method": "GET",
+        "headers": {},
+        "body": {},
+        "validationFn": {"op": "...", ...}
+      }
+    },
+    {
+      "title": "Task 2 Title",
+      "description": "Task 2 description",
+      "points": 50,
+      "verificationType": "discord_role",
+      "discordVerificationConfig": {
+        "roleId": "...",
+        "roleName": "..."
+      }
+    }
+  ]
+}
+\`\`\`
+
+**IMPORTANT**: Always output the complete quest with all tasks in a single \`\`\`quest_definition code block when the admin confirms creation.
 
 ## Important Guidelines
 
@@ -260,6 +370,90 @@ ${quest.description}
 
 Good luck, adventurer!
 `;
+
+/**
+ * Task-based Quest Assignment Message Template
+ * Used when a user runs /quest for a quest with multiple tasks
+ */
+export const QUEST_WITH_TASKS_ASSIGNMENT_TEMPLATE = (quest: {
+  name: string;
+  description: string;
+  totalXp: number;
+  tasks: Array<{
+    title: string;
+    description?: string;
+    points: number;
+    isCompleted: boolean;
+  }>;
+}) => {
+  const taskList = quest.tasks
+    .map((task, i) => {
+      const status = task.isCompleted ? '✅' : '⬜';
+      const desc = task.description ? `\n   ${task.description}` : '';
+      return `${status} **${i + 1}. ${task.title}** (${task.points} XP)${desc}`;
+    })
+    .join('\n');
+
+  const completedCount = quest.tasks.filter(t => t.isCompleted).length;
+  const earnedXp = quest.tasks.filter(t => t.isCompleted).reduce((sum, t) => sum + t.points, 0);
+
+  return `
+🎯 **Quest Assigned: ${quest.name}**
+
+📋 **Description:**
+${quest.description}
+
+📝 **Tasks to Complete (${completedCount}/${quest.tasks.length}):**
+${taskList}
+
+🏆 **Progress:** ${earnedXp}/${quest.totalXp} XP earned
+
+**How to Complete:**
+Complete each task and run \`/confirm\` to verify. We'll check your progress and award XP for each completed task!
+
+Good luck, adventurer!
+`;
+};
+
+/**
+ * Task Completion Success Template
+ * Used when a task (not full quest) is completed
+ */
+export const TASK_COMPLETION_SUCCESS_TEMPLATE = (data: {
+  taskTitle: string;
+  xpEarned: number;
+  totalXp: number;
+  questName: string;
+  tasksCompleted: number;
+  totalTasks: number;
+  allTasksCompleted: boolean;
+}) => {
+  if (data.allTasksCompleted) {
+    return `
+✅ **Task Complete: ${data.taskTitle}**
+
+🎉 **Quest Complete: ${data.questName}!**
+
+All ${data.totalTasks} tasks completed! Congratulations!
+
+💰 **XP Earned:** +${data.xpEarned} XP
+📊 **Total XP:** ${data.totalXp.toLocaleString()} XP
+
+Run \`/quest\` to get your next adventure!
+`;
+  }
+
+  return `
+✅ **Task Complete: ${data.taskTitle}**
+
+💰 **XP Earned:** +${data.xpEarned} XP
+📊 **Total XP:** ${data.totalXp.toLocaleString()} XP
+
+📝 **Quest Progress:** ${data.tasksCompleted}/${data.totalTasks} tasks completed
+
+Run \`/confirm\` to verify your next task!
+`;
+};
 
 /**
  * Quest Completion Success Template
@@ -391,8 +585,14 @@ function formatVerificationType(type: string): string {
     wallet_address: 'wallet address',
     discord_id: 'Discord ID',
     twitter_handle: 'Twitter/X handle',
+    // Discord-native verification types
+    discord_role: 'Discord role verification',
+    discord_message_count: 'message count verification',
+    discord_reaction_count: 'reaction count verification',
+    discord_poll_count: 'poll count verification',
   };
-  return typeMap[type] || type;
+  // Return mapped type or a generic fallback (don't expose internal type names)
+  return typeMap[type] || 'verification identifier';
 }
 
 /**

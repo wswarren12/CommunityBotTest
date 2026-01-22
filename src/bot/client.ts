@@ -12,8 +12,15 @@ export function createClient(): Client {
       GatewayIntentBits.MessageContent, // Required for reading message content
       GatewayIntentBits.GuildMembers,
       GatewayIntentBits.GuildScheduledEvents,
+      GatewayIntentBits.GuildMessageReactions, // Required for tracking reactions
+      GatewayIntentBits.DirectMessages, // Required for DM quest creation
     ],
-    partials: [Partials.Channel, Partials.Message],
+    partials: [
+      Partials.Channel,
+      Partials.Message,
+      Partials.Reaction, // Required for reaction tracking
+      Partials.User,
+    ],
   });
 
   // Log when client is ready

@@ -173,12 +173,17 @@ export interface Quest {
   api_headers?: Record<string, string>;
   api_params?: Record<string, unknown>;
   success_condition?: SuccessCondition;
-  // MCP Connector fields
+  // MCP Connector fields (legacy - single connector per quest)
   connector_id?: number;
   connector_name?: string;
   api_key_env_var?: string;
   user_input_placeholder?: string;
   user_input_description?: string;
+  // Discord-native verification fields
+  discord_verification_config?: DiscordVerificationConfig;
+  // Summon MCP integration fields
+  summon_quest_id?: number;
+  summon_status?: SummonQuestStatus;
   active: boolean;
   max_completions?: number;
   total_completions: number;
@@ -187,7 +192,92 @@ export interface Quest {
   updated_at: Date;
 }
 
-export type VerificationType = 'email' | 'discord_id' | 'wallet_address' | 'twitter_handle';
+/**
+ * Summon MCP quest status
+ */
+export type SummonQuestStatus = 'LIVE' | 'DRAFT' | 'READY' | 'ARCHIVED' | 'SCHEDULED' | 'ENDED' | 'PAUSED';
+
+/**
+ * Quest task - individual task within a quest
+ */
+export interface QuestTask {
+  id: string;
+  quest_id: string;
+  summon_task_id?: number;
+  title: string;
+  description?: string;
+  points: number;
+  connector_id?: number;
+  connector_name?: string;
+  verification_type?: VerificationType;
+  user_input_placeholder?: string;
+  user_input_description?: string;
+  discord_verification_config?: DiscordVerificationConfig;
+  max_completions?: number;
+  max_completions_per_day?: number;
+  position: number;
+  active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+/**
+ * User task completion record
+ */
+export interface UserTaskCompletion {
+  id: string;
+  user_id: string;
+  guild_id: string;
+  task_id: string;
+  quest_id: string;
+  completed_at: Date;
+  xp_awarded: number;
+  verification_identifier?: string;
+}
+
+/**
+ * Quest with its tasks
+ */
+export interface QuestWithTasks extends Quest {
+  tasks: QuestTask[];
+}
+
+/**
+ * Task with completion info
+ */
+export interface TaskWithCompletion extends QuestTask {
+  is_completed?: boolean;
+  completed_at?: Date;
+}
+
+export type VerificationType =
+  | 'email'
+  | 'discord_id'
+  | 'wallet_address'
+  | 'twitter_handle'
+  // Discord-native verification types (no external API needed)
+  | 'discord_role'           // Check if user has a specific role
+  | 'discord_message_count'  // Check user's message count in the server
+  | 'discord_reaction_count' // Check reactions received on user's messages
+  | 'discord_poll_count';    // Check number of polls created by user
+
+/**
+ * Configuration for Discord-native verification
+ * Stored in the discord_verification_config column
+ */
+export interface DiscordVerificationConfig {
+  // For discord_role verification
+  roleId?: string;           // The role ID to check for
+  roleName?: string;         // Human-readable role name (for display)
+
+  // For count-based verifications (message_count, reaction_count, poll_count)
+  threshold?: number;        // Minimum count required
+  operator?: '>' | '>=' | '=' | '<' | '<='; // Comparison operator (default: '>=')
+
+  // Optional: time-based filters
+  sinceDays?: number;        // Only count activity from the last N days
+  channelId?: string;        // Only count activity in a specific channel
+}
 
 export interface SuccessCondition {
   field: string;
@@ -228,6 +318,8 @@ export interface UserQuestWithDetails extends UserQuest {
   api_key_env_var?: string;
   user_input_placeholder?: string;
   user_input_description?: string;
+  // Discord-native verification fields
+  discord_verification_config?: DiscordVerificationConfig;
 }
 
 export interface UserXp {
@@ -264,13 +356,50 @@ export interface CreateQuestParams {
   apiHeaders?: Record<string, string>;
   apiParams?: Record<string, unknown>;
   successCondition?: SuccessCondition;
-  // MCP Connector fields
+  // MCP Connector fields (legacy - single connector per quest)
   connectorId?: number;
   connectorName?: string;
   apiKeyEnvVar?: string;
   userInputPlaceholder?: string;
   userInputDescription?: string;
+  // Discord-native verification fields
+  discordVerificationConfig?: DiscordVerificationConfig;
+  // Summon MCP integration fields
+  summonQuestId?: number;
+  summonStatus?: SummonQuestStatus;
+  // Tasks for the quest
+  tasks?: CreateTaskParams[];
   active?: boolean;
   maxCompletions?: number;
   createdBy: string;
+}
+
+/**
+ * Parameters for creating a quest task
+ */
+export interface CreateTaskParams {
+  title: string;
+  description?: string;
+  points: number;
+  connectorId?: number;
+  connectorName?: string;
+  verificationType?: VerificationType;
+  userInputPlaceholder?: string;
+  userInputDescription?: string;
+  discordVerificationConfig?: DiscordVerificationConfig;
+  maxCompletions?: number;
+  maxCompletionsPerDay?: number;
+  position?: number;
+}
+
+/**
+ * Helper to check if a verification type is Discord-native
+ */
+export function isDiscordNativeVerification(type: VerificationType): boolean {
+  return [
+    'discord_role',
+    'discord_message_count',
+    'discord_reaction_count',
+    'discord_poll_count',
+  ].includes(type);
 }

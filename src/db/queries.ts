@@ -388,41 +388,105 @@ import {
   UserXp,
   QuestConversation,
   CreateQuestParams,
+  QuestTask,
+  UserTaskCompletion,
+  QuestWithTasks,
+  TaskWithCompletion,
+  CreateTaskParams,
+  SummonQuestStatus,
 } from '../types/database';
 
 export async function createQuest(params: CreateQuestParams): Promise<Quest> {
-  const result = await query<Quest>(
-    `INSERT INTO quests (
-      guild_id, name, description, xp_reward, verification_type,
-      api_endpoint, api_method, api_headers, api_params,
-      success_condition, user_input_description,
-      connector_id, connector_name, api_key_env_var, user_input_placeholder,
-      active, max_completions, created_by
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-    RETURNING *`,
-    [
-      params.guildId,
-      params.name,
-      params.description,
-      params.xpReward,
-      params.verificationType,
-      params.apiEndpoint || null,
-      params.apiMethod || 'GET',
-      JSON.stringify(params.apiHeaders || {}),
-      JSON.stringify(params.apiParams || {}),
-      JSON.stringify(params.successCondition || { field: 'balance', operator: '>', value: 0 }),
-      params.userInputDescription,
-      params.connectorId || null,
-      params.connectorName || null,
-      params.apiKeyEnvVar || null,
-      params.userInputPlaceholder || null,
-      params.active ?? true,
-      params.maxCompletions,
-      params.createdBy,
-    ]
-  );
-  return result.rows[0];
+  // Log the attempt for debugging
+  const logger = await import('../utils/logger').then(m => m.logger);
+
+  // Validate required fields early with user-friendly messages
+  if (!params.name || typeof params.name !== 'string' || params.name.trim().length === 0) {
+    throw new Error('Quest name is required and cannot be empty');
+  }
+  if (params.name.length > 100) {
+    throw new Error('Quest name must be 100 characters or less');
+  }
+  if (!params.description || typeof params.description !== 'string' || params.description.trim().length === 0) {
+    throw new Error('Quest description is required and cannot be empty');
+  }
+  if (params.description.length > 1000) {
+    throw new Error('Quest description must be 1000 characters or less');
+  }
+  if (typeof params.xpReward !== 'number' || params.xpReward <= 0 || params.xpReward > 10000) {
+    throw new Error('XP reward must be a number between 1 and 10000');
+  }
+  if (!params.guildId || typeof params.guildId !== 'string') {
+    throw new Error('Guild ID is required');
+  }
+  if (!params.verificationType || typeof params.verificationType !== 'string') {
+    throw new Error('Verification type is required');
+  }
+
+  logger.info('Creating quest in database', {
+    guildId: params.guildId,
+    name: params.name,
+    verificationType: params.verificationType,
+    hasApiEndpoint: !!params.apiEndpoint,
+    hasConnectorId: !!params.connectorId,
+    hasDiscordVerificationConfig: !!params.discordVerificationConfig,
+    active: params.active ?? true,
+  });
+
+  try {
+    const result = await query<Quest>(
+      `INSERT INTO quests (
+        guild_id, name, description, xp_reward, verification_type,
+        api_endpoint, api_method, api_headers, api_params,
+        success_condition, user_input_description,
+        connector_id, connector_name, api_key_env_var, user_input_placeholder,
+        discord_verification_config,
+        active, max_completions, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+      RETURNING *`,
+      [
+        params.guildId,
+        params.name,
+        params.description,
+        params.xpReward,
+        params.verificationType,
+        params.apiEndpoint || null,
+        params.apiMethod || 'GET',
+        JSON.stringify(params.apiHeaders || {}),
+        JSON.stringify(params.apiParams || {}),
+        JSON.stringify(params.successCondition || { field: 'balance', operator: '>', value: 0 }),
+        params.userInputDescription,
+        params.connectorId || null,
+        params.connectorName || null,
+        params.apiKeyEnvVar || null,
+        params.userInputPlaceholder || null,
+        params.discordVerificationConfig ? JSON.stringify(params.discordVerificationConfig) : null,
+        params.active ?? true,
+        params.maxCompletions,
+        params.createdBy,
+      ]
+    );
+
+    logger.info('Quest created successfully', {
+      questId: result.rows[0].id,
+      name: result.rows[0].name,
+      guildId: result.rows[0].guild_id,
+      active: result.rows[0].active,
+    });
+
+    return result.rows[0];
+  } catch (error) {
+    logger.error('Failed to create quest in database', {
+      params: {
+        guildId: params.guildId,
+        name: params.name,
+        verificationType: params.verificationType,
+      },
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    throw error;
+  }
 }
 
 export async function getQuest(questId: string): Promise<Quest | null> {
@@ -431,6 +495,8 @@ export async function getQuest(questId: string): Promise<Quest | null> {
 }
 
 export async function getActiveQuests(guildId: string): Promise<Quest[]> {
+  const logger = await import('../utils/logger').then(m => m.logger);
+
   const result = await query<Quest>(
     `SELECT * FROM quests
      WHERE guild_id = $1 AND active = TRUE
@@ -438,6 +504,13 @@ export async function getActiveQuests(guildId: string): Promise<Quest[]> {
      ORDER BY created_at DESC`,
     [guildId]
   );
+
+  logger.debug('getActiveQuests query result', {
+    guildId,
+    count: result.rows.length,
+    questIds: result.rows.map(q => q.id),
+  });
+
   return result.rows;
 }
 
@@ -481,12 +554,51 @@ export async function assignQuestToUser(
   return result.rows[0];
 }
 
+/**
+ * Atomically assign a quest to a user with race condition protection.
+ * Uses FOR UPDATE SKIP LOCKED to prevent duplicate assignments.
+ * Returns the existing active quest if one exists, or the newly assigned quest.
+ */
+export async function assignQuestToUserAtomic(
+  userId: string,
+  guildId: string,
+  questId: string
+): Promise<{ userQuest: UserQuest; alreadyHadQuest: boolean }> {
+  return transaction(async (client) => {
+    // First, check for existing active quest with row-level lock
+    // Using FOR UPDATE SKIP LOCKED prevents concurrent requests from blocking
+    const existingResult = await client.query<UserQuest>(
+      `SELECT * FROM user_quests
+       WHERE user_id = $1 AND guild_id = $2 AND status = 'assigned'
+       FOR UPDATE SKIP LOCKED
+       LIMIT 1`,
+      [userId, guildId]
+    );
+
+    if (existingResult.rows[0]) {
+      // User already has an active quest
+      return { userQuest: existingResult.rows[0], alreadyHadQuest: true };
+    }
+
+    // No active quest found, safe to assign
+    const insertResult = await client.query<UserQuest>(
+      `INSERT INTO user_quests (user_id, guild_id, quest_id, status)
+       VALUES ($1, $2, $3, 'assigned')
+       RETURNING *`,
+      [userId, guildId, questId]
+    );
+
+    return { userQuest: insertResult.rows[0], alreadyHadQuest: false };
+  });
+}
+
 export async function getUserActiveQuest(userId: string, guildId: string): Promise<UserQuestWithDetails | null> {
   const result = await query<UserQuestWithDetails>(
     `SELECT uq.*, q.name as quest_name, q.description as quest_description,
             q.xp_reward, q.verification_type, q.api_endpoint, q.api_method,
             q.api_headers, q.api_params, q.success_condition, q.user_input_description,
-            q.connector_id, q.connector_name, q.api_key_env_var, q.user_input_placeholder
+            q.connector_id, q.connector_name, q.api_key_env_var, q.user_input_placeholder,
+            q.discord_verification_config
      FROM user_quests uq
      JOIN quests q ON uq.quest_id = q.id
      WHERE uq.user_id = $1 AND uq.guild_id = $2 AND uq.status = 'assigned'
@@ -696,5 +808,622 @@ export async function completeQuestTransaction(
     );
 
     return xpResult.rows[0];
+  });
+}
+
+// ==================== Discord-Native Verification Queries ====================
+
+/**
+ * Get message count for a user in a guild
+ * Optionally filter by channel and time range
+ */
+export async function getUserMessageCount(
+  userId: string,
+  guildId: string,
+  options?: { channelId?: string; sinceDays?: number }
+): Promise<number> {
+  const conditions: string[] = ['user_id = $1', 'guild_id = $2'];
+  const values: (string | Date)[] = [userId, guildId];
+  let paramIndex = 3;
+
+  if (options?.channelId) {
+    conditions.push(`channel_id = $${paramIndex}`);
+    values.push(options.channelId);
+    paramIndex++;
+  }
+
+  if (options?.sinceDays) {
+    // Validate sinceDays to prevent SQL injection - must be a positive integer <= 365
+    const days = Math.floor(Math.abs(Number(options.sinceDays)));
+    if (isNaN(days) || days <= 0 || days > 365) {
+      throw new Error('sinceDays must be a valid number between 1 and 365');
+    }
+    conditions.push(`posted_at >= NOW() - INTERVAL '1 day' * $${paramIndex}`);
+    values.push(days.toString());
+    paramIndex++;
+  }
+
+  const result = await query<{ count: string }>(
+    `SELECT COUNT(*) as count FROM messages WHERE ${conditions.join(' AND ')}`,
+    values
+  );
+
+  return parseInt(result.rows[0]?.count || '0', 10);
+}
+
+/**
+ * Track a reaction on a message
+ */
+export async function trackReaction(
+  messageId: string,
+  channelId: string,
+  guildId: string,
+  authorId: string,
+  reactorId: string,
+  emoji: string
+): Promise<void> {
+  await query(
+    `INSERT INTO message_reactions (message_id, channel_id, guild_id, author_id, reactor_id, emoji)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (message_id, reactor_id, emoji) DO NOTHING`,
+    [messageId, channelId, guildId, authorId, reactorId, emoji]
+  );
+}
+
+/**
+ * Remove a reaction from tracking
+ */
+export async function untrackReaction(
+  messageId: string,
+  reactorId: string,
+  emoji: string
+): Promise<void> {
+  await query(
+    `DELETE FROM message_reactions WHERE message_id = $1 AND reactor_id = $2 AND emoji = $3`,
+    [messageId, reactorId, emoji]
+  );
+}
+
+/**
+ * Get total reactions received by a user's messages in a guild
+ * Optionally filter by channel and time range
+ */
+export async function getUserReactionCount(
+  authorId: string,
+  guildId: string,
+  options?: { channelId?: string; sinceDays?: number }
+): Promise<number> {
+  const conditions: string[] = ['author_id = $1', 'guild_id = $2'];
+  const values: (string | Date)[] = [authorId, guildId];
+  let paramIndex = 3;
+
+  if (options?.channelId) {
+    conditions.push(`channel_id = $${paramIndex}`);
+    values.push(options.channelId);
+    paramIndex++;
+  }
+
+  if (options?.sinceDays) {
+    // Validate sinceDays to prevent SQL injection - must be a positive integer <= 365
+    const days = Math.floor(Math.abs(Number(options.sinceDays)));
+    if (isNaN(days) || days <= 0 || days > 365) {
+      throw new Error('sinceDays must be a valid number between 1 and 365');
+    }
+    conditions.push(`created_at >= NOW() - INTERVAL '1 day' * $${paramIndex}`);
+    values.push(days.toString());
+    paramIndex++;
+  }
+
+  const result = await query<{ count: string }>(
+    `SELECT COUNT(*) as count FROM message_reactions WHERE ${conditions.join(' AND ')}`,
+    values
+  );
+
+  return parseInt(result.rows[0]?.count || '0', 10);
+}
+
+/**
+ * Track a poll creation
+ */
+export async function trackPoll(
+  messageId: string,
+  channelId: string,
+  guildId: string,
+  creatorId: string,
+  question?: string
+): Promise<void> {
+  await query(
+    `INSERT INTO polls (message_id, channel_id, guild_id, creator_id, question)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (message_id) DO NOTHING`,
+    [messageId, channelId, guildId, creatorId, question]
+  );
+}
+
+/**
+ * Get poll count for a user in a guild
+ * Optionally filter by channel and time range
+ */
+export async function getUserPollCount(
+  creatorId: string,
+  guildId: string,
+  options?: { channelId?: string; sinceDays?: number }
+): Promise<number> {
+  const conditions: string[] = ['creator_id = $1', 'guild_id = $2'];
+  const values: (string | Date)[] = [creatorId, guildId];
+  let paramIndex = 3;
+
+  if (options?.channelId) {
+    conditions.push(`channel_id = $${paramIndex}`);
+    values.push(options.channelId);
+    paramIndex++;
+  }
+
+  if (options?.sinceDays) {
+    // Validate sinceDays to prevent SQL injection - must be a positive integer <= 365
+    const days = Math.floor(Math.abs(Number(options.sinceDays)));
+    if (isNaN(days) || days <= 0 || days > 365) {
+      throw new Error('sinceDays must be a valid number between 1 and 365');
+    }
+    conditions.push(`created_at >= NOW() - INTERVAL '1 day' * $${paramIndex}`);
+    values.push(days.toString());
+    paramIndex++;
+  }
+
+  const result = await query<{ count: string }>(
+    `SELECT COUNT(*) as count FROM polls WHERE ${conditions.join(' AND ')}`,
+    values
+  );
+
+  return parseInt(result.rows[0]?.count || '0', 10);
+}
+
+// ==================== Quest Tasks ====================
+
+/**
+ * Create a quest task
+ */
+export async function createQuestTask(
+  questId: string,
+  task: CreateTaskParams
+): Promise<QuestTask> {
+  const result = await query<QuestTask>(
+    `INSERT INTO quest_tasks (
+      quest_id, title, description, points,
+      connector_id, connector_name, verification_type,
+      user_input_placeholder, user_input_description,
+      discord_verification_config,
+      max_completions, max_completions_per_day, position
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    RETURNING *`,
+    [
+      questId,
+      task.title,
+      task.description || null,
+      task.points || 0,
+      task.connectorId || null,
+      task.connectorName || null,
+      task.verificationType || null,
+      task.userInputPlaceholder || null,
+      task.userInputDescription || null,
+      task.discordVerificationConfig ? JSON.stringify(task.discordVerificationConfig) : null,
+      task.maxCompletions || null,
+      task.maxCompletionsPerDay || null,
+      task.position ?? 0,
+    ]
+  );
+  return result.rows[0];
+}
+
+/**
+ * Create multiple tasks for a quest in a transaction
+ */
+export async function createQuestTasks(
+  questId: string,
+  tasks: CreateTaskParams[]
+): Promise<QuestTask[]> {
+  return transaction(async (client) => {
+    const createdTasks: QuestTask[] = [];
+
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
+      const result = await client.query<QuestTask>(
+        `INSERT INTO quest_tasks (
+          quest_id, title, description, points,
+          connector_id, connector_name, verification_type,
+          user_input_placeholder, user_input_description,
+          discord_verification_config,
+          max_completions, max_completions_per_day, position
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        RETURNING *`,
+        [
+          questId,
+          task.title,
+          task.description || null,
+          task.points || 0,
+          task.connectorId || null,
+          task.connectorName || null,
+          task.verificationType || null,
+          task.userInputPlaceholder || null,
+          task.userInputDescription || null,
+          task.discordVerificationConfig ? JSON.stringify(task.discordVerificationConfig) : null,
+          task.maxCompletions || null,
+          task.maxCompletionsPerDay || null,
+          task.position ?? i,
+        ]
+      );
+      createdTasks.push(result.rows[0]);
+    }
+
+    return createdTasks;
+  });
+}
+
+/**
+ * Get all tasks for a quest
+ */
+export async function getQuestTasks(questId: string): Promise<QuestTask[]> {
+  const result = await query<QuestTask>(
+    `SELECT * FROM quest_tasks
+     WHERE quest_id = $1 AND active = TRUE
+     ORDER BY position ASC`,
+    [questId]
+  );
+  return result.rows;
+}
+
+/**
+ * Get a quest with all its tasks
+ */
+export async function getQuestWithTasks(questId: string): Promise<QuestWithTasks | null> {
+  const quest = await getQuest(questId);
+  if (!quest) return null;
+
+  const tasks = await getQuestTasks(questId);
+
+  return {
+    ...quest,
+    tasks,
+  };
+}
+
+/**
+ * Get task by ID
+ */
+export async function getTask(taskId: string): Promise<QuestTask | null> {
+  const result = await query<QuestTask>(
+    `SELECT * FROM quest_tasks WHERE id = $1`,
+    [taskId]
+  );
+  return result.rows[0] || null;
+}
+
+/**
+ * Update a task's Summon MCP ID
+ */
+export async function updateTaskSummonId(
+  taskId: string,
+  summonTaskId: number
+): Promise<void> {
+  await query(
+    `UPDATE quest_tasks SET summon_task_id = $1, updated_at = NOW() WHERE id = $2`,
+    [summonTaskId, taskId]
+  );
+}
+
+/**
+ * Update a task's connector ID
+ */
+export async function updateTaskConnector(
+  taskId: string,
+  connectorId: number,
+  connectorName?: string
+): Promise<void> {
+  await query(
+    `UPDATE quest_tasks
+     SET connector_id = $1, connector_name = $2, updated_at = NOW()
+     WHERE id = $3`,
+    [connectorId, connectorName || null, taskId]
+  );
+}
+
+/**
+ * Update quest's Summon MCP ID and status
+ */
+export async function updateQuestSummonInfo(
+  questId: string,
+  summonQuestId: number,
+  summonStatus?: SummonQuestStatus
+): Promise<void> {
+  await query(
+    `UPDATE quests
+     SET summon_quest_id = $1, summon_status = $2, updated_at = NOW()
+     WHERE id = $3`,
+    [summonQuestId, summonStatus || 'DRAFT', questId]
+  );
+}
+
+// ==================== User Task Completions ====================
+
+/**
+ * Record a task completion for a user
+ */
+export async function createTaskCompletion(
+  userId: string,
+  guildId: string,
+  taskId: string,
+  questId: string,
+  xpAwarded: number,
+  verificationIdentifier?: string
+): Promise<UserTaskCompletion> {
+  const result = await query<UserTaskCompletion>(
+    `INSERT INTO user_task_completions (user_id, guild_id, task_id, quest_id, xp_awarded, verification_identifier)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (user_id, task_id) DO NOTHING
+     RETURNING *`,
+    [userId, guildId, taskId, questId, xpAwarded, verificationIdentifier || null]
+  );
+  return result.rows[0];
+}
+
+/**
+ * Check if a user has completed a specific task
+ */
+export async function hasUserCompletedTask(
+  userId: string,
+  taskId: string
+): Promise<boolean> {
+  const result = await query<{ exists: boolean }>(
+    `SELECT EXISTS(
+      SELECT 1 FROM user_task_completions
+      WHERE user_id = $1 AND task_id = $2
+    ) as exists`,
+    [userId, taskId]
+  );
+  return result.rows[0]?.exists || false;
+}
+
+/**
+ * Get all task completions for a user in a quest
+ */
+export async function getUserQuestTaskCompletions(
+  userId: string,
+  questId: string
+): Promise<UserTaskCompletion[]> {
+  const result = await query<UserTaskCompletion>(
+    `SELECT * FROM user_task_completions
+     WHERE user_id = $1 AND quest_id = $2
+     ORDER BY completed_at ASC`,
+    [userId, questId]
+  );
+  return result.rows;
+}
+
+/**
+ * Get tasks for a quest with user's completion status
+ */
+export async function getQuestTasksWithCompletion(
+  questId: string,
+  userId: string
+): Promise<TaskWithCompletion[]> {
+  const result = await query<TaskWithCompletion>(
+    `SELECT t.*,
+            CASE WHEN utc.id IS NOT NULL THEN TRUE ELSE FALSE END as is_completed,
+            utc.completed_at
+     FROM quest_tasks t
+     LEFT JOIN user_task_completions utc ON t.id = utc.task_id AND utc.user_id = $2
+     WHERE t.quest_id = $1 AND t.active = TRUE
+     ORDER BY t.position ASC`,
+    [questId, userId]
+  );
+  return result.rows;
+}
+
+/**
+ * Count how many tasks a user has completed for a quest
+ */
+export async function getUserQuestTaskCompletionCount(
+  userId: string,
+  questId: string
+): Promise<number> {
+  const result = await query<{ count: string }>(
+    `SELECT COUNT(*) as count FROM user_task_completions
+     WHERE user_id = $1 AND quest_id = $2`,
+    [userId, questId]
+  );
+  return parseInt(result.rows[0]?.count || '0', 10);
+}
+
+/**
+ * Get total task count for a quest
+ */
+export async function getQuestTaskCount(questId: string): Promise<number> {
+  const result = await query<{ count: string }>(
+    `SELECT COUNT(*) as count FROM quest_tasks
+     WHERE quest_id = $1 AND active = TRUE`,
+    [questId]
+  );
+  return parseInt(result.rows[0]?.count || '0', 10);
+}
+
+/**
+ * Check if user has completed all tasks in a quest
+ */
+export async function hasUserCompletedAllQuestTasks(
+  userId: string,
+  questId: string
+): Promise<boolean> {
+  const taskCount = await getQuestTaskCount(questId);
+  const completionCount = await getUserQuestTaskCompletionCount(userId, questId);
+  return taskCount > 0 && completionCount >= taskCount;
+}
+
+/**
+ * Complete a task and award XP in a transaction
+ */
+export async function completeTaskTransaction(
+  userId: string,
+  guildId: string,
+  taskId: string,
+  questId: string,
+  xpAwarded: number,
+  verificationIdentifier?: string
+): Promise<{ taskCompletion: UserTaskCompletion; userXp: UserXp; allTasksCompleted: boolean }> {
+  return transaction(async (client) => {
+    // 1. Create task completion record
+    const completionResult = await client.query<UserTaskCompletion>(
+      `INSERT INTO user_task_completions (user_id, guild_id, task_id, quest_id, xp_awarded, verification_identifier)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [userId, guildId, taskId, questId, xpAwarded, verificationIdentifier || null]
+    );
+    const taskCompletion = completionResult.rows[0];
+
+    // 2. Add XP to user
+    const xpResult = await client.query<UserXp>(
+      `INSERT INTO user_xp (user_id, guild_id, total_xp, quests_completed, last_quest_at)
+       VALUES ($1, $2, $3, 0, NOW())
+       ON CONFLICT (user_id, guild_id)
+       DO UPDATE SET
+         total_xp = user_xp.total_xp + $3,
+         last_quest_at = NOW(),
+         updated_at = NOW()
+       RETURNING *`,
+      [userId, guildId, xpAwarded]
+    );
+    const userXp = xpResult.rows[0];
+
+    // 3. Check if all tasks are completed
+    const taskCountResult = await client.query<{ count: string }>(
+      `SELECT COUNT(*) as count FROM quest_tasks
+       WHERE quest_id = $1 AND active = TRUE`,
+      [questId]
+    );
+    const taskCount = parseInt(taskCountResult.rows[0]?.count || '0', 10);
+
+    const completionCountResult = await client.query<{ count: string }>(
+      `SELECT COUNT(*) as count FROM user_task_completions
+       WHERE user_id = $1 AND quest_id = $2`,
+      [userId, questId]
+    );
+    const completionCount = parseInt(completionCountResult.rows[0]?.count || '0', 10);
+
+    const allTasksCompleted = taskCount > 0 && completionCount >= taskCount;
+
+    // 4. If all tasks completed, update user_quests and quests table
+    if (allTasksCompleted) {
+      // Mark user quest as completed
+      await client.query(
+        `UPDATE user_quests
+         SET status = 'completed', completed_at = NOW()
+         WHERE user_id = $1 AND guild_id = $2 AND quest_id = $3 AND status = 'assigned'`,
+        [userId, guildId, questId]
+      );
+
+      // Increment quest total completions
+      await client.query(
+        `UPDATE quests SET total_completions = total_completions + 1, updated_at = NOW() WHERE id = $1`,
+        [questId]
+      );
+
+      // Increment quests_completed in user_xp
+      await client.query(
+        `UPDATE user_xp SET quests_completed = quests_completed + 1, updated_at = NOW()
+         WHERE user_id = $1 AND guild_id = $2`,
+        [userId, guildId]
+      );
+    }
+
+    return { taskCompletion, userXp, allTasksCompleted };
+  });
+}
+
+/**
+ * Create a quest with tasks in a single transaction
+ */
+export async function createQuestWithTasks(
+  params: CreateQuestParams
+): Promise<QuestWithTasks> {
+  return transaction(async (client) => {
+    // 1. Create the quest
+    const questResult = await client.query<Quest>(
+      `INSERT INTO quests (
+        guild_id, name, description, xp_reward, verification_type,
+        api_endpoint, api_method, api_headers, api_params,
+        success_condition, user_input_description,
+        connector_id, connector_name, api_key_env_var, user_input_placeholder,
+        discord_verification_config, summon_quest_id, summon_status,
+        active, max_completions, created_by
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+      RETURNING *`,
+      [
+        params.guildId,
+        params.name,
+        params.description,
+        params.xpReward,
+        params.verificationType,
+        params.apiEndpoint || null,
+        params.apiMethod || 'GET',
+        JSON.stringify(params.apiHeaders || {}),
+        JSON.stringify(params.apiParams || {}),
+        JSON.stringify(params.successCondition || { field: 'balance', operator: '>', value: 0 }),
+        params.userInputDescription,
+        params.connectorId || null,
+        params.connectorName || null,
+        params.apiKeyEnvVar || null,
+        params.userInputPlaceholder || null,
+        params.discordVerificationConfig ? JSON.stringify(params.discordVerificationConfig) : null,
+        params.summonQuestId || null,
+        params.summonStatus || null,
+        params.active ?? true,
+        params.maxCompletions,
+        params.createdBy,
+      ]
+    );
+
+    const quest = questResult.rows[0];
+    const tasks: QuestTask[] = [];
+
+    // 2. Create tasks if provided
+    if (params.tasks && params.tasks.length > 0) {
+      for (let i = 0; i < params.tasks.length; i++) {
+        const task = params.tasks[i];
+        const taskResult = await client.query<QuestTask>(
+          `INSERT INTO quest_tasks (
+            quest_id, title, description, points,
+            connector_id, connector_name, verification_type,
+            user_input_placeholder, user_input_description,
+            discord_verification_config,
+            max_completions, max_completions_per_day, position
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          RETURNING *`,
+          [
+            quest.id,
+            task.title,
+            task.description || null,
+            task.points || 0,
+            task.connectorId || null,
+            task.connectorName || null,
+            task.verificationType || null,
+            task.userInputPlaceholder || null,
+            task.userInputDescription || null,
+            task.discordVerificationConfig ? JSON.stringify(task.discordVerificationConfig) : null,
+            task.maxCompletions || null,
+            task.maxCompletionsPerDay || null,
+            task.position ?? i,
+          ]
+        );
+        tasks.push(taskResult.rows[0]);
+      }
+    }
+
+    return {
+      ...quest,
+      tasks,
+    };
   });
 }

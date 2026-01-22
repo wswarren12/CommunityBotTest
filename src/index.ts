@@ -11,12 +11,15 @@ import { logger } from './utils/logger';
 import { handleReady } from './bot/events/ready';
 import { handleMessageCreate } from './bot/events/messageCreate';
 import { handleInteractionCreate } from './bot/events/interactionCreate';
+import { handleMessageReactionAdd } from './bot/events/messageReactionAdd';
+import { handleMessageReactionRemove } from './bot/events/messageReactionRemove';
 import { syncDiscordEvents, detectEventsFromMessages } from './services/eventService';
 import { testConnection } from './services/aiService';
 import { startCacheCleanup, stopCacheCleanup } from './commands/catchup';
 import { startRateLimitCleanup, stopRateLimitCleanup } from './utils/rateLimiter';
 import { startQuestRateLimitCleanup, stopQuestRateLimitCleanup } from './services/questService';
 import { mcpClient } from './services/mcpClient';
+import { setDiscordClient } from './services/discordVerificationService';
 
 /**
  * Main application entry point
@@ -46,6 +49,9 @@ async function main() {
     client.once('ready', async (c) => {
       await handleReady(c);
 
+      // Initialize Discord verification service with the client
+      setDiscordClient(c);
+
       // Sync Discord events for all guilds
       for (const [, guild] of c.guilds.cache) {
         await syncDiscordEvents(guild);
@@ -57,6 +63,10 @@ async function main() {
 
     client.on('messageCreate', handleMessageCreate);
     client.on('interactionCreate', handleInteractionCreate);
+
+    // Register reaction event handlers for quest tracking
+    client.on('messageReactionAdd', handleMessageReactionAdd);
+    client.on('messageReactionRemove', handleMessageReactionRemove);
 
     // Handle scheduled events
     client.on('guildScheduledEventCreate', async (event) => {

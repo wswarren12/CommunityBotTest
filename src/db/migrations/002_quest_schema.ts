@@ -95,17 +95,20 @@ export async function up(pool: Pool): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_quest_conversations_expires ON quest_conversations(expires_at);
     `);
 
-    // Triggers for updated_at
+    // Triggers for updated_at (drop first to make idempotent)
+    await client.query(`DROP TRIGGER IF EXISTS update_quests_updated_at ON quests`);
     await client.query(`
       CREATE TRIGGER update_quests_updated_at BEFORE UPDATE ON quests
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     `);
 
+    await client.query(`DROP TRIGGER IF EXISTS update_user_xp_updated_at ON user_xp`);
     await client.query(`
       CREATE TRIGGER update_user_xp_updated_at BEFORE UPDATE ON user_xp
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     `);
 
+    await client.query(`DROP TRIGGER IF EXISTS update_quest_conversations_updated_at ON quest_conversations`);
     await client.query(`
       CREATE TRIGGER update_quest_conversations_updated_at BEFORE UPDATE ON quest_conversations
         FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
